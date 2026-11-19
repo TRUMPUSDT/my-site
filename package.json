@@ -1,0 +1,8 @@
+{
+  "name": "rust-tracker",
+  "version": "1.0.0",
+  "description": "Профили и отслеживание игроков Rust по Steam ID",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
