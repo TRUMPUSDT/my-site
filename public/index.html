@@ -106,6 +106,13 @@ input::placeholder,textarea::placeholder{color:#767a72}
 dialog{background:var(--plate);color:var(--bone);border:1px solid var(--line);padding:18px;max-width:min(1040px,96vw)}
 dialog::backdrop{background:rgba(0,0,0,.7)}
 dialog canvas{width:100%;height:auto;display:block;margin-bottom:12px}
+#login{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;gap:10px}
+#login .logo{font-size:64px}
+#me{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;display:flex;gap:10px;align-items:center}
+#me img{width:32px;height:32px}
+#me div{min-width:0;flex:1}
+#me b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#me .x{padding:0;color:var(--dim);background:none;border:0;cursor:pointer;text-decoration:underline;font-size:13px}
 @media (max-width:820px){
   .app{grid-template-columns:1fr}
   aside{position:static;max-height:none;border-right:0;border-bottom:1px solid var(--line)}
@@ -117,12 +124,19 @@ dialog canvas{width:100%;height:auto;display:block;margin-bottom:12px}
 </style>
 </head>
 <body>
-<div class="app">
+<div id="login" hidden>
+  <p class="logo">Rust<br>Tracker</p>
+  <p class="sub" style="margin:0">Слежка за игроками Rust: профили, онлайн, баны и оповещения в Telegram.</p>
+  <a class="btn" style="display:inline-flex;align-items:center;margin-top:12px" href="/auth/login">Войти через Steam</a>
+  <p class="hint" style="max-width:46ch">Пароль Steam мы не видим: вход идёт на сайте Steam. Читайте <a href="/privacy">политику конфиденциальности</a>.</p>
+</div>
+<div class="app" id="app">
   <aside>
     <p class="logo">Rust<br>Tracker</p>
     <h2>Слежка</h2>
     <ul class="watch" id="watch"></ul>
     <p class="hint" id="watchHint">Пока пусто. Найдите игрока и нажмите «Следить»: сервер будет записывать его онлайн, ники и баны.</p>
+  <div id="me" hidden></div>
   </aside>
   <main>
     <nav>
@@ -130,7 +144,7 @@ dialog canvas{width:100%;height:auto;display:block;margin-bottom:12px}
       <button class="tab" data-tab="compare">Сравнение</button>
       <button class="tab" data-tab="rating">Рейтинг</button>
       <button class="tab" data-tab="servers">Серверы</button>
-      <button class="tab" data-tab="settings">Telegram</button>
+      <button class="tab" data-tab="settings">Настройки</button>
     </nav>
 
     <section class="pane" id="p-profile">
@@ -177,7 +191,7 @@ dialog canvas{width:100%;height:auto;display:block;margin-bottom:12px}
     </section>
 
     <section class="pane" id="p-settings" hidden>
-      <h1>Telegram</h1>
+      <h1>Настройки</h1>
       <div id="setOut"></div>
     </section>
   </main>
@@ -213,6 +227,7 @@ async function api(u,body){
   const o=body!==undefined?{method:'POST',headers:{'x-rt':'1','content-type':'application/json'},body:JSON.stringify(body)}:{};
   const r=await fetch(u,o); let d={};
   try{d=await r.json()}catch{}
+  if(r.status===401&&d.login){showLogin();throw new Error(d.error)}
   if(!r.ok)throw new Error(d.error||'Ошибка сервера');
   return d;
 }
@@ -307,12 +322,13 @@ function renderProfile(){
     ?`<ul class="names">${names.map(n=>`<li>${esc(n.name)} <span>с ${dt(n.t)}</span></li>`).join('')}</ul>`
     :'<p class="note">Пока один ник. Новые имена появятся здесь, когда игрок сменит ник, а вы или слежка это заметите.</p>';
 
-  const track=t?`<div class="sec"><h3>Слежка</h3>
+  const tgOk=S.cfg.telegram&&S.cfg.telegram.linked;
+  const track=d.optout?`<div class="sec"><h3>Слежка</h3><p class="note" style="margin-top:0">Этот игрок отказался от слежки. Вы видите только его открытый профиль Steam прямо сейчас, история не ведётся.</p></div>`:t?`<div class="sec"><h3>Слежка</h3>
       <div class="chips" id="chips"></div>
       <div class="row"><input type="text" id="tagIn" placeholder="Новый тег, Enter" maxlength="24" list="tagSug"></div>
       <div class="row"><input type="text" id="grpIn" value="${esc(t.group)}" placeholder="Группа или клан" maxlength="30" list="grpList"></div>
       <textarea id="noteIn" rows="3" maxlength="1000" placeholder="Заметка">${esc(t.note)}</textarea>
-      <label class="chk"><input type="checkbox" id="alertIn" ${t.alertRust?'checked':''}> Сообщать в Telegram, когда зайдёт в Rust</label>
+      <label class="chk"><input type="checkbox" id="alertIn" ${t.alertRust?'checked':''}> Сообщать в Telegram, когда зайдёт в Rust${tgOk?'':' (сначала подключите Telegram в «Настройках»)'}</label>
       <div id="hist"><p class="note">Загружаем историю…</p></div></div>`
     :`<div class="sec"><h3>Слежка</h3><p class="note" style="margin-top:0">Добавьте игрока в слежку: сервер начнёт записывать его онлайн, сервера, баны и смену ников, а ещё откроются теги и заметки.</p></div>`;
 
@@ -333,7 +349,7 @@ function renderProfile(){
     <div class="sec"><h3>История ников</h3>${namesBlock}</div>
     ${track}
     <div class="sec"><div class="actions" style="margin-top:0">
-      <button class="btn" id="wbtn">${t?'Убрать из слежки':'Следить за игроком'}</button>
+      ${d.optout?'':`<button class="btn" id="wbtn">${t?'Убрать из слежки':'Следить за игроком'}</button>`}
       <button class="btn ghost" id="cardBtn">Карточка для Telegram</button>
       <button class="btn ghost" id="cmpBtn">Сравнить с…</button>
       <button class="btn ghost" id="cbtn">Скопировать SteamID</button>
@@ -341,7 +357,7 @@ function renderProfile(){
     </div></div>
   </article>`;
 
-  $('#wbtn').onclick=async e=>{
+  if($('#wbtn'))$('#wbtn').onclick=async e=>{
     e.target.disabled=true;
     try{await api(t?'/api/untrack':'/api/track',{id:p.steamid});await reload()}catch(x){alert(x.message);e.target.disabled=false}
   };
@@ -504,26 +520,54 @@ async function loadServers(){
 }
 $('#srvOut').addEventListener('click',e=>{const a=e.target.closest('a[data-id]');if(a){e.preventDefault();lookup(a.dataset.id)}});
 
-/* ---------- Telegram ---------- */
+/* ---------- настройки: Telegram и приватность ---------- */
+function showLogin(){$('#login').hidden=false;$('#app').hidden=true}
+function renderMe(){
+  const c=S.cfg,el=$('#me'); if(c.mode!=='multi'||!c.user){el.hidden=true;return}
+  el.hidden=false;
+  el.innerHTML=`${c.user.avatar?`<img src="${esc(c.user.avatar)}" alt="">`:''}<div><b>${esc(c.user.name)}</b><button class="x" id="logout">Выйти</button></div>`;
+  $('#logout').onclick=async()=>{await api('/auth/logout',{}).catch(()=>{});location.reload()};
+}
+async function refreshMe(){try{S.cfg=await api('/api/me')}catch{}}
 function renderSettings(){
-  const c=S.cfg;
-  $('#setOut').innerHTML=`<p class="sub">Через Telegram приходят: новые баны игроков из слежки, вход в Rust (если включено у игрока) и карточки профилей.</p>
-    <p>Статус: ${c.telegram?'<b class="ok">подключён</b>':'<b class="err">не настроен</b>'}</p>
-    ${c.telegram?'<div class="actions"><button class="btn" id="tgTest">Отправить тест</button></div><p class="note" id="tgMsg"></p>'
-    :'<p class="note">Создайте бота у @BotFather, впишите токен в TG_BOT_TOKEN, напишите боту /start, затем откройте api.telegram.org/bot&lt;ТОКЕН&gt;/getUpdates и скопируйте chat id в TG_CHAT_ID. Перезапустите сервер.</p>'}
-    <p class="note">Опрос слежки: раз в ${c.pollSec} с. Проверка банов: раз в ${c.banMin} мин. Часовой пояс графика: ${esc(c.tz)}.</p>`;
-  const b=$('#tgTest'); if(b)b.onclick=async()=>{
-    $('#tgMsg').className='note'; $('#tgMsg').textContent='Отправляем…';
-    try{await api('/api/test-telegram',{});$('#tgMsg').className='note ok';$('#tgMsg').textContent='Сообщение отправлено.'}
-    catch(e){$('#tgMsg').className='note err';$('#tgMsg').textContent=e.message}
+  const c=S.cfg,t=c.telegram||{},multi=c.mode==='multi';
+  let tg;
+  if(!t.configured) tg='<p class="note">На сервере не задан TG_BOT_TOKEN, поэтому оповещения выключены.</p>';
+  else if(t.linked) tg=`<p>Статус: <b class="ok">подключён</b></p><div class="actions"><button class="btn" id="tgTest">Отправить тест</button>${multi?'<button class="btn ghost" id="tgUnlink">Отключить</button>':''}</div><p class="note" id="tgMsg"></p>`;
+  else if(multi) tg='<p>Статус: <b class="err">не подключён</b></p><div class="actions"><button class="btn" id="tgLink">Подключить Telegram</button></div><p class="note" id="tgMsg">Откроется чат с ботом, нажмите в нём «Запустить».</p>';
+  else tg='<p>Статус: <b class="err">не подключён</b></p><p class="note">Впишите TG_BOT_TOKEN и TG_CHAT_ID в .env и перезапустите сервер.</p>';
+  const priv=multi&&c.user?`<h3 style="margin-top:30px">Приватность</h3>
+    <label class="chk"><input type="checkbox" id="optIn" ${c.user.optout?'checked':''}> Не отслеживать мой аккаунт: другие не смогут добавить меня в слежку, накопленная история будет удалена</label>
+    <div class="actions"><button class="btn ghost" id="delMe">Удалить мои данные с сайта</button><a class="btn ghost" href="/privacy" target="_blank">Политика конфиденциальности</a></div>`:'';
+  $('#setOut').innerHTML=`<p class="sub">Через Telegram приходят новые баны игроков из слежки, вход в Rust (включается у каждого игрока) и карточки профилей.</p>${tg}
+    <p class="note">Опрос слежки: раз в ${c.pollSec} с. Проверка банов: раз в ${c.banMin} мин. В слежке до ${c.maxWatch} игроков. Часовой пояс графика: ${esc(c.tz)}.</p>${priv}`;
+  const msg=(txt,cls)=>{const m=$('#tgMsg');if(m){m.className='note '+(cls||'');m.innerHTML=txt}};
+  const test=$('#tgTest'); if(test)test.onclick=async()=>{msg('Отправляем…');try{await api('/api/test-telegram',{});msg('Сообщение отправлено.','ok')}catch(e){msg(esc(e.message),'err')}};
+  const un=$('#tgUnlink'); if(un)un.onclick=async()=>{await api('/api/tg/unlink',{});await refreshMe();renderSettings()};
+  const ln=$('#tgLink'); if(ln)ln.onclick=async()=>{
+    try{
+      const r=await api('/api/tg/link',{});
+      msg(`Откройте <a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a> и нажмите «Запустить». Эта страница обновится сама.`);
+      window.open(r.url,'_blank');
+      for(let i=0;i<60;i++){await new Promise(ok=>setTimeout(ok,3000));await refreshMe();if(S.cfg.telegram.linked){renderSettings();return}}
+    }catch(e){msg(esc(e.message),'err')}
+  };
+  const oi=$('#optIn'); if(oi)oi.onchange=async()=>{
+    if(oi.checked&&!confirm('Вас уберут из всех списков слежки, история будет удалена. Продолжить?')){oi.checked=false;return}
+    await api('/api/optout',{on:oi.checked});await refreshMe();loadTracked();
+  };
+  const dm=$('#delMe'); if(dm)dm.onclick=async()=>{
+    if(!confirm('Удалить ваш аккаунт на сайте, ваш список слежки и привязку Telegram?'))return;
+    await api('/api/delete-me',{});location.reload();
   };
 }
 
 /* ---------- запуск ---------- */
 $('#f').addEventListener('submit',e=>{e.preventDefault();lookup($('#q').value)});
 (async()=>{
-  try{S.cfg=await api('/api/config')}catch{}
-  loadTracked(); setInterval(loadTracked,30000);
+  try{S.cfg=await api('/api/me')}catch{S.cfg={mode:'local',telegram:{}}}
+  if(S.cfg.mode==='multi'&&!S.cfg.user){showLogin();return}
+  renderMe(); loadTracked(); setInterval(loadTracked,30000);
   if(/^#\d{17}$/.test(location.hash))lookup(location.hash.slice(1));
 })();
 </script>

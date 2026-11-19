@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Rust Tracker на Python. Только стандартная библиотека, нужен Python 3.9+.
-Интерфейс (public/index.html), файл .env и база data/db.json общие с версией на Node."""
-import atexit, base64, hmac, json, os, re, sys, threading, time, uuid
+Два режима:
+  локальный  (PUBLIC_URL пуст): один пользователь, без входа, как раньше;
+  публичный  (PUBLIC_URL задан): вход через Steam, у каждого свой список слежки и свой Telegram."""
+import atexit, base64, hmac, json, os, re, secrets, sys, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 try:
     from zoneinfo import ZoneInfo
@@ -41,13 +44,19 @@ def num(name, default, minimum):
 
 KEY = E.get('STEAM_API_KEY', '')
 PORT = num('PORT', 3000, 1)
+HOST = E.get('HOST') or '127.0.0.1'
+PUBLIC_URL = (E.get('PUBLIC_URL') or '').rstrip('/')
+MULTI = bool(PUBLIC_URL)
 TG_TOKEN, TG_CHAT = E.get('TG_BOT_TOKEN', ''), E.get('TG_CHAT_ID', '')
-PASS = E.get('ACCESS_PASSWORD', '')
 POLL_SEC = num('POLL_SEC', 60, 20)
 BAN_MIN = num('BAN_CHECK_MIN', 30, 5)
+MAX_WATCH = num('MAX_WATCH', 30, 1) if MULTI else 300
+LOOKUPS_PER_DAY = num('LOOKUPS_PER_DAY', 300, 10)
 TZ = E.get('TZ_NAME') or 'Europe/Warsaw'
 RUST = '252490'
 BASE = 76561197960265728
+BOT_USERNAME = None
+LOCAL_USER = {'sid': 'local', 'name': 'Локальный режим', 'avatar': ''}
 try:
     TZI = ZoneInfo(TZ) if ZoneInfo else None
 except Exception:
@@ -68,8 +77,11 @@ def rnd(x):  # округление как в JS, а не «банковское
 
 
 # ---------------- хранилище (JSON-файл) ----------------
+# players: общие данные об отслеживаемых аккаунтах (история одна на всех)
+# watch:   watch[кто_следит][за_кем] = теги, заметка, группа, флаг оповещения
+# users, sessions, optout: вход, сессии и отказавшиеся от слежки
 DB_FILE = os.path.join(HERE, 'data', 'db.json')
-db = {'players': {}, 'names': {}}
+db = {'players': {}, 'names': {}, 'watch': {}, 'users': {}, 'sessions': {}, 'optout': []}
 lock = threading.RLock()
 dirty = False
 try:
@@ -77,6 +89,19 @@ try:
         db.update(json.load(f))
 except (OSError, ValueError):
     pass
+
+
+def migrate():  # старый формат (теги внутри игрока) -> новый
+    for tid, rec in db['players'].items():
+        if 'tags' in rec:
+            db['watch'].setdefault('local', {})[tid] = {
+                'tags': rec.pop('tags'), 'note': rec.pop('note', ''), 'group': rec.pop('group', ''),
+                'alertRust': rec.pop('alertRust', False), 'added': rec.get('added', int(time.time()))}
+    t = int(time.time())
+    db['sessions'] = {k: v for k, v in db['sessions'].items() if v['exp'] > t}
+
+
+migrate()
 
 
 def save():
@@ -268,28 +293,28 @@ def server_name(addr):
 
 
 # ---------------- Telegram ----------------
-tg_on = lambda: bool(TG_TOKEN and TG_CHAT)
-
-
-def tg(text):
-    if not tg_on():
-        return False
+def tg_api(method, payload, timeout=15):
     try:
-        fetch('https://api.telegram.org/bot%s/sendMessage' % TG_TOKEN,
-              data=json.dumps({'chat_id': TG_CHAT, 'text': text, 'parse_mode': 'HTML',
-                               'disable_web_page_preview': True}).encode(),
-              headers={'Content-Type': 'application/json'})
-        return True
+        body, _ = fetch('https://api.telegram.org/bot%s/%s' % (TG_TOKEN, method), data=json.dumps(payload).encode(),
+                        headers={'Content-Type': 'application/json'}, timeout=timeout)
+        return json.loads(body)
     except Exception:
+        return None
+
+
+def tg(chat, text):
+    if not (TG_TOKEN and chat):
         return False
+    r = tg_api('sendMessage', {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True})
+    return bool(r and r.get('ok'))
 
 
-def tg_photo(png, caption):
-    if not tg_on():
+def tg_photo(chat, png, caption):
+    if not (TG_TOKEN and chat):
         return False
     b = uuid.uuid4().hex
     parts = []
-    for k, v in (('chat_id', TG_CHAT), ('caption', caption), ('parse_mode', 'HTML')):
+    for k, v in (('chat_id', chat), ('caption', caption), ('parse_mode', 'HTML')):
         parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (b, k, v)).encode())
     parts.append(('--%s\r\nContent-Disposition: form-data; name="photo"; filename="card.png"\r\n'
                   'Content-Type: image/png\r\n\r\n' % b).encode() + png + b'\r\n')
@@ -300,6 +325,98 @@ def tg_photo(png, caption):
         return True
     except Exception:
         return False
+
+
+def chat_of(sid):
+    """Куда слать сообщения этому пользователю."""
+    if not TG_TOKEN:
+        return None
+    if not MULTI:
+        return TG_CHAT or None
+    return dig(db['users'].get(sid), 'tg', 'chat')
+
+
+def user_chat(user):
+    with lock:
+        return chat_of(user['sid'])
+
+
+def watchers(tid):
+    with lock:
+        return [(sid, w[tid]) for sid, w in db['watch'].items() if tid in w]
+
+
+def drop_orphans():
+    used = set()
+    for w in db['watch'].values():
+        used.update(w)
+    for tid in [t for t in db['players'] if t not in used]:
+        del db['players'][tid]
+
+
+def handle_update(u):
+    """Входящее сообщение боту: привязка чата по коду с сайта, /stop, /status."""
+    m = u.get('message') or {}
+    chat, text = dig(m, 'chat', 'id'), (m.get('text') or '').strip()
+    if not chat or dig(m, 'chat', 'type') != 'private':
+        return
+    if text.startswith('/start'):
+        code = text[6:].strip()
+        if not code:
+            tg(chat, 'Привет! Чтобы получать оповещения, откройте сайт, зайдите в «Настройки» и нажмите «Подключить Telegram».')
+            return
+        with lock:
+            user = next((x for x in db['users'].values() if x.get('link_code') == code and x.get('link_exp', 0) > now()), None)
+            if user:
+                for x in db['users'].values():
+                    if dig(x, 'tg', 'chat') == chat:
+                        x.pop('tg', None)
+                user['tg'] = {'chat': chat, 't': now()}
+                user.pop('link_code', None)
+                user.pop('link_exp', None)
+                save()
+        tg(chat, '✅ Готово, %s. Сюда будут приходить новые баны игроков из вашей слежки и вход в Rust, если вы включили это у игрока.\n/status — кто сейчас онлайн, /stop — отключить.' % hesc(user['name'])
+           if user else 'Ссылка устарела. Нажмите «Подключить Telegram» на сайте ещё раз.')
+    elif text.startswith('/stop'):
+        with lock:
+            for x in db['users'].values():
+                if dig(x, 'tg', 'chat') == chat:
+                    x.pop('tg', None)
+            save()
+        tg(chat, 'Оповещения отключены. Подключить снова можно на сайте.')
+    elif text.startswith('/status'):
+        with lock:
+            user = next((x for x in db['users'].values() if dig(x, 'tg', 'chat') == chat), None)
+            lines = []
+            if user:
+                for tid in db['watch'].get(user['sid'], {}):
+                    r = db['players'].get(tid)
+                    l = (r or {}).get('last') or {}
+                    if l.get('gameid') == RUST:
+                        lines.append('🟠 %s в Rust' % hesc(r['name']))
+                    elif l.get('state', 0) > 0 or l.get('gameid'):
+                        lines.append('🟢 %s в сети' % hesc(r['name']))
+        tg(chat, '\n'.join(lines) if lines else ('Сейчас никого из слежки нет в сети.' if user else 'Чат не привязан к аккаунту. Подключите Telegram на сайте.'))
+
+
+def bot_loop():
+    global BOT_USERNAME
+    BOT_USERNAME = dig(tg_api('getMe', {}), 'result', 'username')
+    off = 0
+    while True:
+        try:
+            r = tg_api('getUpdates', {'offset': off, 'timeout': 25, 'allowed_updates': ['message']}, timeout=35)
+            if r is None:
+                time.sleep(5)
+                continue
+            for u in r.get('result', []):
+                off = u['update_id'] + 1
+                try:
+                    handle_update(u)
+                except Exception as e:
+                    print('bot:', e, file=sys.stderr)
+        except Exception:
+            time.sleep(5)
 
 
 # ---------------- история, ники, баны ----------------
@@ -325,8 +442,33 @@ def ev(rec, typ, **extra):
     save()
 
 
-def pub(r):
-    return {k: r.get(k) for k in ('id', 'name', 'avatar', 'tags', 'note', 'group', 'alertRust', 'last', 'bans', 'added')}
+def W(user):  # список слежки конкретного пользователя
+    return db['watch'].setdefault(user['sid'], {})
+
+
+def pub(user, tid):
+    r, m = db['players'][tid], W(user).get(tid, {})
+    return {'id': tid, 'name': r['name'], 'avatar': r['avatar'], 'last': r.get('last'), 'bans': r.get('bans'),
+            'added': m.get('added'), 'tags': m.get('tags', []), 'note': m.get('note', ''),
+            'group': m.get('group', ''), 'alertRust': m.get('alertRust', False)}
+
+
+def notify(alerts):
+    for kind, tid, name, a, b, c in alerts:
+        if kind == 'rust':
+            sn = server_name(a)
+            text = '🎮 <b>%s</b> зашёл в Rust' % hesc(name) + \
+                   ('\nСервер: ' + hesc(sn['name']) if sn else '\nСервер: ' + hesc(a) if a else '') + '\n' + plink(tid)
+        else:
+            text = '🚨 <b>%s</b>: новый бан\nVAC: %s, игровых: %s%s\n%s' % (
+                hesc(name), a, b, ', бан сообщества' if c else '', plink(tid))
+        for sid, meta in watchers(tid):
+            if kind == 'rust' and not meta.get('alertRust'):
+                continue
+            chat = chat_of(sid)
+            if chat:
+                tg(chat, text)
+                time.sleep(0.05)
 
 
 poll_lock = threading.Lock()
@@ -360,8 +502,7 @@ def poll():
                             ev(rec, 'offline')
                         if prev['gameid'] != RUST and rust_now:
                             ev(rec, 'rust_start', server=p['server'])
-                            if rec.get('alertRust'):
-                                alerts.append((p['name'], p['server'], rec['id']))
+                            alerts.append(('rust', rec['id'], p['name'], p['server'], None, None))
                         elif prev['gameid'] == RUST and not rust_now:
                             ev(rec, 'rust_stop')
                         elif rust_now and prev.get('server') != p['server']:
@@ -374,10 +515,7 @@ def poll():
                     if rust_now:
                         cell[2] += 1
             save()
-        for name, srv, sid in alerts:
-            sn = server_name(srv)
-            tg('🎮 <b>%s</b> зашёл в Rust' % hesc(name) +
-               ('\nСервер: ' + hesc(sn['name']) if sn else '\nСервер: ' + hesc(srv) if srv else '') + '\n' + plink(sid))
+        notify(alerts)
     except Exception as e:
         print('poll:', e, file=sys.stderr)
     finally:
@@ -388,6 +526,7 @@ def check_bans():
     try:
         with lock:
             ids = list(db['players'])
+        alerts = []
         for i in range(0, len(ids), 100):
             d = steam('ISteamUser/GetPlayerBans/v1/', {'steamids': ','.join(ids[i:i + 100])}, 0)
             for b in d.get('players', []):
@@ -400,35 +539,109 @@ def check_bans():
                     o = rec.get('bans')
                     if o and (nb['vac'] > o['vac'] or nb['game'] > o['game'] or (nb['community'] and not o['community'])):
                         ev(rec, 'ban', vac=nb['vac'], game=nb['game'])
-                        tg('🚨 <b>%s</b>: новый бан\nVAC: %s, игровых: %s%s\n%s' % (
-                            hesc(rec['name']), nb['vac'], nb['game'], ', бан сообщества' if nb['community'] else '', plink(rec['id'])))
+                        alerts.append(('ban', rec['id'], rec['name'], nb['vac'], nb['game'], nb['community']))
                     rec['bans'] = nb
             save()
+        notify(alerts)
     except Exception as e:
         print('bans:', e, file=sys.stderr)
 
 
+# ---------------- вход через Steam (OpenID 2.0) ----------------
+def openid_login_url():
+    p = {'openid.ns': 'http://specs.openid.net/auth/2.0', 'openid.mode': 'checkid_setup',
+         'openid.return_to': PUBLIC_URL + '/auth/callback', 'openid.realm': PUBLIC_URL,
+         'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
+         'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select'}
+    return 'https://steamcommunity.com/openid/login?' + urllib.parse.urlencode(p)
+
+
+def openid_verify(Q):
+    """Возвращает SteamID64, если Steam подтвердил вход, иначе None."""
+    if Q.get('openid.mode') != 'id_res' or Q.get('openid.return_to') != PUBLIC_URL + '/auth/callback':
+        return None
+    m = re.fullmatch(r'https://steamcommunity\.com/openid/id/(\d{17})', Q.get('openid.claimed_id', ''))
+    if not m:
+        return None
+    chk = dict(Q)
+    chk['openid.mode'] = 'check_authentication'
+    try:
+        body, _ = fetch('https://steamcommunity.com/openid/login', data=urllib.parse.urlencode(chk).encode(),
+                        headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    except Exception:
+        return None
+    return m.group(1) if b'is_valid:true' in body else None
+
+
+def login_user(sid):
+    try:
+        s = (status([sid], 0) or [{}])[0]
+    except Exception:
+        s = {}
+    t = now()
+    with lock:
+        u = db['users'].setdefault(sid, {'sid': sid, 'created': t})
+        u['name'] = s.get('name') or u.get('name') or 'Игрок ' + sid[-4:]
+        u['avatar'] = s.get('avatar') or u.get('avatar', '')
+        tok = secrets.token_urlsafe(32)
+        db['sessions'] = {k: v for k, v in db['sessions'].items() if v['exp'] > t}
+        db['sessions'][tok] = {'sid': sid, 'exp': t + 30 * 86400}
+        save()
+    return tok
+
+
+# ---------------- лимиты ----------------
+rl, daily = {}, {}
+
+
+def rate_ok(key, limit, window=60):
+    t = time.time()
+    a = [x for x in rl.get(key, []) if x > t - window]
+    ok = len(a) < limit
+    if ok:
+        a.append(t)
+    rl[key] = a
+    if len(rl) > 20000:
+        rl.clear()
+    return ok
+
+
+def lookup_ok(user):
+    if not MULTI:
+        return True
+    k = (user['sid'], time.strftime('%Y-%m-%d'))
+    if len(daily) > 20000:
+        daily.clear()
+    daily[k] = daily.get(k, 0) + 1
+    return daily[k] <= LOOKUPS_PER_DAY and rate_ok(('p', user['sid']), 20)
+
+
 # ---------------- HTTP ----------------
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+       "font-src https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
-
-    def send(self, code, obj):
-        b = json.dumps(obj, ensure_ascii=False).encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
 
     def raw(self, code, data, ctype, extra=()):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if ctype.startswith('text/html'):
+            self.send_header('Content-Security-Policy', CSP)
         for k, v in extra:
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
+
+    def send(self, code, obj, extra=()):
+        self.raw(code, json.dumps(obj, ensure_ascii=False).encode('utf-8'), 'application/json; charset=utf-8', extra)
+
+    def redirect(self, url, extra=()):
+        self.raw(302, b'', 'text/plain', [('Location', url)] + list(extra))
 
     def body(self, mx=3_000_000):
         n = int(self.headers.get('Content-Length') or 0)
@@ -442,6 +655,27 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
+    def token(self):
+        try:
+            c = cookies.SimpleCookie(self.headers.get('Cookie', ''))
+            return c['rt_session'].value if 'rt_session' in c else None
+        except Exception:
+            return None
+
+    def user(self):
+        if not MULTI:
+            return LOCAL_USER
+        tok = self.token()
+        with lock:
+            s = db['sessions'].get(tok) if tok else None
+            if s and s['exp'] > now():
+                return db['users'].get(s['sid'])
+        return None
+
+    def cookie(self, value, age):
+        return ('Set-Cookie', 'rt_session=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s' % (
+            value, age, '; Secure' if PUBLIC_URL.startswith('https') else ''))
+
     def do_GET(self):
         self.route('GET')
 
@@ -452,20 +686,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlsplit(self.path)
         P, Q = u.path, dict(urllib.parse.parse_qsl(u.query))
         try:
-            if PASS:
-                h = self.headers.get('Authorization', '')
-                pw = ''
-                if h.startswith('Basic '):
-                    try:
-                        pw = base64.b64decode(h[6:]).decode('utf-8').partition(':')[2]
-                    except Exception:
-                        pass
-                if not hmac.compare_digest(pw, PASS):
-                    return self.raw(401, 'Нужен пароль'.encode('utf-8'), 'text/plain; charset=utf-8',
-                                    [('WWW-Authenticate', 'Basic realm="Rust Tracker"')])
             if method == 'POST' and self.headers.get('x-rt') != '1':
                 return self.send(403, {'error': 'forbidden'})
-            self.handle_api(method, P, Q)
+            self.dispatch(method, P, Q)
         except SteamError as e:
             self.send(429 if e.status == 429 else 502,
                       {'error': 'Steam ограничил запросы, подождите минуту.' if e.status == 429 else 'Ошибка: ' + str(e)})
@@ -477,31 +700,68 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def handle_api(self, method, P, Q):
+    def page(self, name):
+        with open(os.path.join(HERE, 'public', name), 'rb') as f:
+            self.raw(200, f.read(), 'text/html; charset=utf-8')
+
+    def dispatch(self, method, P, Q):
         if P in ('/', '/index.html'):
-            with open(os.path.join(HERE, 'public', 'index.html'), 'rb') as f:
-                return self.raw(200, f.read(), 'text/html; charset=utf-8')
+            return self.page('index.html')
+        if P == '/privacy':
+            return self.page('privacy.html')
 
-        if P == '/api/config':
-            return self.send(200, {'telegram': tg_on(), 'tz': TZ, 'pollSec': POLL_SEC, 'banMin': BAN_MIN, 'locked': bool(PASS)})
+        # --- вход и выход ---
+        if P == '/auth/login':
+            return self.redirect(openid_login_url() if MULTI else '/')
+        if P == '/auth/callback':
+            sid = openid_verify(Q) if MULTI else None
+            if not sid:
+                return self.raw(400, 'Не удалось войти через Steam. Вернитесь на сайт и попробуйте ещё раз.'.encode('utf-8'), 'text/plain; charset=utf-8')
+            return self.redirect('/', [self.cookie(login_user(sid), 30 * 86400)])
+        if P == '/auth/logout' and method == 'POST':
+            tok = self.token()
+            with lock:
+                db['sessions'].pop(tok, None)
+                save()
+            return self.send(200, {'ok': True}, [self.cookie('', 0)])
 
+        user = self.user()
+        if P == '/api/me':
+            chat = user_chat(user) if user else None
+            me = {'mode': 'multi' if MULTI else 'local', 'user': None, 'tz': TZ, 'pollSec': POLL_SEC, 'banMin': BAN_MIN,
+                  'maxWatch': MAX_WATCH, 'telegram': {'configured': bool(TG_TOKEN), 'linked': bool(chat), 'bot': BOT_USERNAME}}
+            if user:
+                me['user'] = {'sid': user['sid'], 'name': user['name'], 'avatar': user.get('avatar', ''),
+                              'optout': user['sid'] in db['optout']}
+            return self.send(200, me)
+        if P.startswith('/api/') and not user:
+            return self.send(401, {'error': 'Войдите через Steam', 'login': True})
+
+        # --- профили ---
         if P == '/api/player':
+            if not lookup_ok(user):
+                return self.send(429, {'error': 'Слишком много поисков. Подождите минуту или попробуйте завтра.'})
             sid = resolve(Q.get('q'))
             if not sid:
                 return self.send(404, {'error': 'Профиль не найден. Проверьте SteamID или ссылку.'})
             d = player(sid)
             if not d:
                 return self.send(404, {'error': 'Такого аккаунта нет.'})
-            record_name(sid, d['profile'].get('personaname'))
             with lock:
-                d['names'] = list(db['names'].get(sid, []))
-                d['tracked'] = pub(db['players'][sid]) if sid in db['players'] else None
+                opt = sid in db['optout']
+            if not opt:
+                record_name(sid, d['profile'].get('personaname'))
+            with lock:
+                d['names'] = [] if opt else list(db['names'].get(sid, []))
+                d['tracked'] = pub(user, sid) if sid in W(user) and sid in db['players'] else None
+                d['optout'] = opt
             d['serverInfo'] = server_name(d['profile'].get('gameserverip')) if d['profile'].get('gameid') == RUST else None
             return self.send(200, d)
 
+        # --- слежка ---
         if P == '/api/tracked':
             with lock:
-                recs = [pub(r) for r in db['players'].values()]
+                recs = [pub(user, t) for t in W(user) if t in db['players']]
 
             def add(o):
                 l = o.get('last') or {}
@@ -516,40 +776,45 @@ class Handler(BaseHTTPRequestHandler):
             if not is_id(sid):
                 return self.send(400, {'error': 'Некорректный SteamID'})
             with lock:
-                if sid in db['players']:
-                    return self.send(200, pub(db['players'][sid]))
-                if len(db['players']) >= 300:
-                    return self.send(400, {'error': 'Лимит слежки: 300 игроков'})
-            lst = status([sid], 0)
-            if not lst:
-                return self.send(404, {'error': 'Аккаунт не найден'})
-            s = lst[0]
-            bn = dig(safe(steam, 'ISteamUser/GetPlayerBans/v1/', {'steamids': sid}, 0), 'players', 0)
+                if sid in db['optout']:
+                    return self.send(403, {'error': 'Этот игрок отказался от слежки.'})
+                if sid in W(user):
+                    return self.send(200, pub(user, sid))
+                if len(W(user)) >= MAX_WATCH:
+                    return self.send(400, {'error': 'Лимит слежки: %d игроков. Уберите кого-нибудь из списка.' % MAX_WATCH})
+                exists = sid in db['players']
+            if not exists:
+                lst = status([sid], 0)
+                if not lst:
+                    return self.send(404, {'error': 'Аккаунт не найден'})
+                s = lst[0]
+                bn = dig(safe(steam, 'ISteamUser/GetPlayerBans/v1/', {'steamids': sid}, 0), 'players', 0)
             with lock:
-                db['players'][sid] = {
-                    'id': sid, 'name': s['name'], 'avatar': s['avatar'], 'tags': [], 'note': '',
-                    'group': clean(b.get('group'), 30), 'alertRust': False, 'added': now(),
-                    'last': {'state': s['state'], 'gameid': s['gameid'], 'game': s['game'], 'server': s['server'], 't': now()},
-                    'bans': {'vac': bn['NumberOfVACBans'], 'game': bn['NumberOfGameBans'], 'community': bn['CommunityBanned'],
-                             'econ': bn['EconomyBan'], 'days': bn['DaysSinceLastBan']} if bn else None,
-                    'heat': [[0, 0, 0] for _ in range(168)], 'events': [],
-                }
-                record_name(sid, s['name'])
+                if not exists and sid not in db['players']:
+                    db['players'][sid] = {
+                        'id': sid, 'name': s['name'], 'avatar': s['avatar'], 'added': now(),
+                        'last': {'state': s['state'], 'gameid': s['gameid'], 'game': s['game'], 'server': s['server'], 't': now()},
+                        'bans': {'vac': bn['NumberOfVACBans'], 'game': bn['NumberOfGameBans'], 'community': bn['CommunityBanned'],
+                                 'econ': bn['EconomyBan'], 'days': bn['DaysSinceLastBan']} if bn else None,
+                        'heat': [[0, 0, 0] for _ in range(168)], 'events': []}
+                    record_name(sid, s['name'])
+                W(user)[sid] = {'tags': [], 'note': '', 'group': clean(b.get('group'), 30), 'alertRust': False, 'added': now()}
                 save()
-                return self.send(200, pub(db['players'][sid]))
+                return self.send(200, pub(user, sid))
 
         if P == '/api/untrack' and method == 'POST':
             b = self.jbody()
             with lock:
-                db['players'].pop(b.get('id'), None)
+                W(user).pop(b.get('id'), None)
+                drop_orphans()
                 save()
             return self.send(200, {'ok': True})
 
         if P == '/api/meta' and method == 'POST':
             b = self.jbody()
             with lock:
-                r = db['players'].get(b.get('id'))
-                if not r:
+                m = W(user).get(b.get('id'))
+                if m is None or b.get('id') not in db['players']:
                     return self.send(404, {'error': 'Игрок не в слежке'})
                 if isinstance(b.get('tags'), list):
                     tags = []
@@ -557,27 +822,29 @@ class Handler(BaseHTTPRequestHandler):
                         x = clean(x, 24)
                         if x and x not in tags:
                             tags.append(x)
-                    r['tags'] = tags[:10]
+                    m['tags'] = tags[:10]
                 if b.get('note') is not None:
-                    r['note'] = clean(b['note'], 1000)
+                    m['note'] = clean(b['note'], 1000)
                 if b.get('group') is not None:
-                    r['group'] = clean(b['group'], 30)
+                    m['group'] = clean(b['group'], 30)
                 if b.get('alertRust') is not None:
-                    r['alertRust'] = bool(b['alertRust'])
+                    m['alertRust'] = bool(b['alertRust'])
                 save()
-                return self.send(200, pub(r))
+                return self.send(200, pub(user, b['id']))
 
         if P == '/api/history':
             sid = Q.get('id')
             with lock:
-                r = db['players'].get(sid)
+                r = db['players'].get(sid) if sid in W(user) else None
                 return self.send(200, {'heat': r['heat'] if r else None, 'events': list(r['events']) if r else [],
                                        'names': list(db['names'].get(sid, [])), 'tz': TZ})
 
         if P == '/api/rating':
+            if MULTI and not rate_ok(('r', user['sid']), 4):
+                return self.send(429, {'error': 'Рейтинг можно обновлять не чаще 4 раз в минуту.'})
             g = Q.get('group') or ''
             with lock:
-                recs = [(r['id'], r.get('group', '')) for r in db['players'].values() if not g or r.get('group') == g]
+                recs = [(t, m.get('group', '')) for t, m in W(user).items() if t in db['players'] and (not g or m.get('group') == g)]
 
             def one(item):
                 d = safe(player, item[0])
@@ -590,11 +857,12 @@ class Handler(BaseHTTPRequestHandler):
         if P == '/api/servers':
             by = {}
             with lock:
-                for r in db['players'].values():
-                    l = r.get('last') or {}
+                for t, m in W(user).items():
+                    r = db['players'].get(t)
+                    l = (r or {}).get('last') or {}
                     if l.get('gameid') == RUST:
                         by.setdefault(l.get('server') or '?', []).append(
-                            {'id': r['id'], 'name': r['name'], 'avatar': r['avatar'], 'group': r.get('group', '')})
+                            {'id': t, 'name': r['name'], 'avatar': r['avatar'], 'group': m.get('group', '')})
             rows = [{'addr': None if a == '?' else a, 'info': None if a == '?' else server_name(a), 'players': pl}
                     for a, pl in by.items()]
             rows.sort(key=lambda x: -len(x['players']))
@@ -611,19 +879,70 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(404, {'error': 'no avatar'})
             return self.raw(200, data, hd.get('Content-Type') or 'image/jpeg', [('Cache-Control', 'public, max-age=86400')])
 
+        # --- Telegram ---
+        if P == '/api/tg/link' and method == 'POST':
+            if not MULTI:
+                return self.send(400, {'error': 'В локальном режиме впишите TG_CHAT_ID в .env'})
+            if not TG_TOKEN or not BOT_USERNAME:
+                return self.send(400, {'error': 'Бот не настроен на сервере или ещё запускается. Попробуйте через минуту.'})
+            code = secrets.token_hex(8)
+            with lock:
+                user['link_code'], user['link_exp'] = code, now() + 900
+                save()
+            return self.send(200, {'url': 'https://t.me/%s?start=%s' % (BOT_USERNAME, code)})
+
+        if P == '/api/tg/unlink' and method == 'POST':
+            with lock:
+                user.pop('tg', None)
+                save()
+            return self.send(200, {'ok': True})
+
         if P == '/api/share' and method == 'POST':
-            if not tg_on():
-                return self.send(400, {'error': 'Telegram не настроен: задайте TG_BOT_TOKEN и TG_CHAT_ID в .env'})
+            chat = user_chat(user)
+            if not chat:
+                return self.send(400, {'error': 'Сначала подключите Telegram во вкладке «Настройки».'})
             png = self.body()
-            ok = tg_photo(png, hesc(clean(Q.get('cap'), 500)))
-            return self.send(200 if ok else 502, {'ok': True} if ok else {'error': 'Telegram не принял картинку. Проверьте токен и chat id.'})
+            ok = tg_photo(chat, png, hesc(clean(Q.get('cap'), 500)))
+            return self.send(200 if ok else 502, {'ok': True} if ok else {'error': 'Telegram не принял картинку. Попробуйте подключить бота заново.'})
 
         if P == '/api/test-telegram' and method == 'POST':
-            ok = tg('✅ Rust Tracker подключён к этому чату.')
-            if ok:
+            chat = user_chat(user)
+            if not chat:
+                return self.send(400, {'error': 'Telegram не подключён.'})
+            if tg(chat, '✅ Rust Tracker подключён к этому чату.'):
                 return self.send(200, {'ok': True})
-            return self.send(502, {'error': 'Telegram не ответил. Напишите боту /start и проверьте chat id.' if tg_on()
-                                   else 'Не заданы TG_BOT_TOKEN и TG_CHAT_ID.'})
+            return self.send(502, {'error': 'Telegram не ответил. Напишите боту /start и подключите заново.'})
+
+        # --- приватность ---
+        if P == '/api/optout' and method == 'POST':
+            if not MULTI:
+                return self.send(400, {'error': 'Доступно только в публичном режиме'})
+            on = bool(self.jbody().get('on'))
+            me = user['sid']
+            with lock:
+                if on:
+                    if me not in db['optout']:
+                        db['optout'].append(me)
+                    for w in db['watch'].values():
+                        w.pop(me, None)
+                    db['players'].pop(me, None)
+                    db['names'].pop(me, None)
+                elif me in db['optout']:
+                    db['optout'].remove(me)
+                save()
+            return self.send(200, {'optout': on})
+
+        if P == '/api/delete-me' and method == 'POST':
+            if not MULTI:
+                return self.send(400, {'error': 'Доступно только в публичном режиме'})
+            me = user['sid']
+            with lock:
+                db['users'].pop(me, None)
+                db['watch'].pop(me, None)
+                db['sessions'] = {k: v for k, v in db['sessions'].items() if v['sid'] != me}
+                drop_orphans()
+                save()
+            return self.send(200, {'ok': True}, [self.cookie('', 0)])
 
         self.raw(404, b'Not found', 'text/plain')
 
@@ -641,9 +960,12 @@ def main():
     threading.Thread(target=lambda: [flush() or time.sleep(5) for _ in iter(int, 1)], daemon=True).start()
     for fn, iv, dl in ((poll, POLL_SEC, 3), (check_bans, BAN_MIN * 60, 15)):
         threading.Thread(target=loop, args=(fn, iv, dl), daemon=True).start()
-    srv = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+    if TG_TOKEN and MULTI:
+        threading.Thread(target=bot_loop, daemon=True).start()
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
-    print('Rust Tracker: http://localhost:%s%s' % (PORT, '  (Telegram подключён)' if tg_on() else '  (Telegram не настроен)'))
+    print('Rust Tracker (%s): %s' % ('публичный режим' if MULTI else 'локальный режим', PUBLIC_URL or 'http://localhost:%s' % PORT))
+    print('Telegram: ' + ('бот включён' if TG_TOKEN else 'не настроен'))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
