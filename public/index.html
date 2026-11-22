@@ -126,6 +126,8 @@ dialog canvas{width:100%;height:auto;display:block;margin-bottom:12px}
 .cat .r:first-of-type{border-top:0}
 .cat .r span{color:var(--dim)}
 .cat .r b{font-variant-numeric:tabular-nums}
+.cat details{margin-top:2px}
+.cat summary{cursor:pointer;color:var(--dim);padding:8px 0;font-size:13px}
 details.more{margin-top:16px}
 details.more summary{cursor:pointer;color:var(--dim)}
 details.more .r{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid var(--line);max-width:560px}
@@ -226,7 +228,7 @@ details.more code{color:var(--dim);font-size:13px}
       <div id="wipeHero"></div>
       <h3 style="margin:0 0 6px">Мои серверы</h3>
       <p class="sub" style="margin-bottom:14px">Добавьте сервер: сайт покажет, когда он вайпался в последний раз, и пришлёт сообщение в Telegram, как только вайп произойдёт.</p>
-      <form id="wf"><input type="text" id="wq" placeholder="Ссылка BattleMetrics или IP:порт (например 1.2.3.4:28015)" required><button class="btn" type="submit">Найти</button></form>
+      <form id="wf"><input type="text" id="wq" placeholder="IP:порт, строка connect из игры, название или ссылка BattleMetrics" required><button class="btn" type="submit">Найти</button></form>
       <div id="wPrev"></div>
       <div id="msList"></div>
     </section>
@@ -257,7 +259,7 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const STATE=['не в сети','в сети','не беспокоить','нет на месте','спит','хочет обмен','хочет играть'];
 const DAYS=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
-const fmtN=n=>n==null?'—':Number(n).toLocaleString('ru-RU');
+const fmtN=n=>n==null?'—':Number(n).toLocaleString('ru-RU',{maximumFractionDigits:0});
 const hrs=m=>m==null?'—':fmtN(Math.round(m/60))+' ч';
 const date=ts=>ts?new Date(ts*1000).toLocaleDateString('ru-RU',{year:'numeric',month:'long',day:'numeric'}):'—';
 const dt=ts=>new Date(ts*1000).toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
@@ -333,16 +335,49 @@ const ICONS={
   gun:'<path d="M8 21V10l4-6 4 6v11z"/><path d="M8 15h8"/>',
   pick:'<path d="M5 20 14 11"/><path d="M10 5c5-1 9 2 9 8-1-3-4-5-9-5z"/>',
   build:'<path d="M3 11 12 3l9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/>',
-  life:'<path d="M10 14V5a2 2 0 0 1 4 0v9a4 4 0 1 1-4 0z"/><path d="M12 9v6"/>'
+  life:'<path d="M10 14V5a2 2 0 0 1 4 0v9a4 4 0 1 1-4 0z"/><path d="M12 9v6"/>',
+  skull:'<circle cx="12" cy="10" r="6"/><path d="M9 20v-3M15 20v-3M9.5 10h.01M14.5 10h.01"/>',
+  menu:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/>',
+  boat:'<path d="M3 15h18l-3 5H6z"/><path d="M12 3v12M12 4l6 8h-6"/>',
+  music:'<path d="M9 18V6l10-2v12"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="16" r="2"/>',
+  misc:'<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>'
 };
 // [подпись, [возможные имена статистики в Steam], 'dur' если это секунды]
 const CATS=[
  {t:'PvP',c:'var(--blood)',i:'pvp',rows:[['Убийств игроков',['kill_player']],['Смертей',['deaths','death_player']],['Хедшотов',['headshot']],['Ранен',['wounded']],['Поднял раненых',['wounded_assisted','wounded_healed']],['Убийств учёных',['kill_scientist']],['Убийств медведей',['kill_bear']],['Убийств кабанов',['kill_boar']],['Убийств волков',['kill_wolf']],['Убийств оленей',['kill_stag']],['Самоубийств',['death_suicide']]]},
  {t:'Оружие',c:'var(--rust)',i:'gun',rows:[['Пуль выпущено',['bullet_fired']],['Попаданий по игрокам',['bullet_hit_player']],['Дробовик, выстрелов',['shotgun_fired']],['Попаданий дробовиком',['shotgun_hit_player','shotgun_hit_entity']],['Стрел выпущено',['arrow_fired']],['Попаданий стрелами',['arrow_hit_player','arrow_hit_entity']],['Ракет выпущено',['rocket_fired']],['Гранат брошено',['grenade_thrown']]]},
  {t:'Ресурсы',c:'var(--moss)',i:'pick',rows:[['Дерево',['harvest.wood']],['Камень',['harvest.stones']],['Метал. руда',['harvest.metal_ore']],['Ткань',['harvest.cloth']],['Металлолом',['acquired_scrap']],['Топливо (LGF)',['acquired_lowgradefuel']],['Бочек сломано',['destroyed_barrels']]]},
- {t:'Строительство',c:'#5b8db8',i:'build',rows:[['Блоков поставлено',['placed_blocks']],['Блоков улучшено',['upgraded_blocks']],['Чертежей изучено',['blueprint_studied']],['Предметов создано',['item_crafted','crafted_items']],['Предметов осмотрено',['item_inspected','inspected_items']]]},
+ {t:'Строительство',c:'#5b8db8',i:'build',rows:[['Блоков поставлено',['placed_blocks']],['Блоков улучшено',['upgraded_blocks']],['Чертежей изучено',['blueprint_studied']],['Предметов создано',['item_crafted','crafted_items']],['Предметов осмотрено',['item_inspected','inspected_items','ITEM_EXAMINED']]]},
  {t:'Выживание',c:'#4ea5a0',i:'life',rows:[['Калорий потреблено',['calories_consumed']],['Воды потреблено',['water_consumed']],['Рад. облучение',['radiation_exposure_duration'],'dur'],['Замерзание',['cold_exposure_duration'],'dur'],['Жара',['hot_exposure_duration'],'dur'],['Ударов ближним',['melee_strikes']]]}
 ];
+const T={player:'игроки',entity:'объекты',building:'постройки',bear:'медведи',boar:'кабаны',wolf:'волки',stag:'олени',chicken:'куры',horse:'лошади',sign:'таблички',playercorpse:'трупы игроков',scientist:'учёные',zombie:'зомби',snake:'змеи',shark:'акулы',crocodile:'крокодилы',panther:'пантеры',tiger:'тигры'};
+const IT={'metal.ore':'метал. руды',wood:'дерева',stones:'камня',cloth:'ткани',scrap:'металлолома',lowgradefuel:'топлива','fat.animal':'жира',leather:'кожи','bone.fragments':'костей','sulfur.ore':'серной руды','metal.fragments':'металла'};
+const DICT={CRAFTING_OPENED:'Открыто меню крафта',CUPBOARD_OPENED:'Открыто шкафов',INVENTORY_OPENED:'Открыто инвентарей',MAP_OPENED:'Карта открыта (раз)',ITEM_EXAMINED:'Предметов осмотрено',ORE_HIT:'Ударов по руде',TREE_HIT:'Ударов по деревьям',STAT_EAT_COCONUT:'Съедено кокосов',STAT_LOOT_MAINLAND:'Лута на материке',InstrumentNotesPlayed:'Сыграно нот',InstrumentFullKeyboardMode:'Полная клавиатура (раз)',arrows_shot:'Выстрелов из лука (всего)',bee_attacks_count:'Атак пчёл',boat_steering_wheel_mounted_count:'За штурвалом лодки (раз)',boat_steering_wheel_placed_count:'Штурвалов лодки поставлено'};
+const pretty=k=>{const s=k.replace(/[._]+/g,' ').replace(/([a-z])([A-Z])/g,'$1 $2').toLowerCase();return s.charAt(0).toUpperCase()+s.slice(1)};
+function nice(k){
+  if(DICT[k])return DICT[k]; let m;
+  if(m=k.match(/^(bullet|arrow|shotgun)_hit_(.+)$/))return `${{bullet:'Пули',arrow:'Стрелы',shotgun:'Дробь'}[m[1]]} → ${T[m[2]]||pretty(m[2])}`;
+  if(m=k.match(/^kill_(.+)$/))return 'Убито: '+(T[m[1]]||pretty(m[1]));
+  if(m=k.match(/^death_(.+)$/))return 'Смерть: '+pretty(m[1]);
+  if(m=k.match(/^acquired_(.+)$/))return 'Получено '+(IT[m[1]]||pretty(m[1]));
+  if(m=k.match(/^harvest\.(.+)$/))return 'Добыто '+(IT[m[1]]||pretty(m[1]));
+  return pretty(k);
+}
+const EXTRA=[
+ {t:'Попадания',c:'var(--rust)',i:'gun',re:/^(bullet|arrow|shotgun)_hit_/},
+ {t:'Охота',c:'#a3a04b',i:'pvp',re:/^kill_/},
+ {t:'Смерти и ранения',c:'var(--blood)',i:'skull',re:/^(death_|wounded)/},
+ {t:'Добыча',c:'var(--moss)',i:'pick',re:/^(acquired_|harvest\.)|^(ORE|TREE)_HIT$/},
+ {t:'Меню и интерфейс',c:'#8a78b8',i:'menu',re:/_OPENED$|^ITEM_EXAMINED$/},
+ {t:'Транспорт',c:'#4ea5a0',i:'boat',re:/^(boat|horse|car|bike|heli|minicopter|kayak|vehicle|train|snowmobile|rhib|submarine)/i},
+ {t:'Музыка',c:'#c28aa6',i:'music',re:/^Instrument/},
+ {t:'Разное',c:'var(--dim)',i:'misc',re:/./}
+];
+function extraCard(c,items){
+  const row=([k,v])=>`<div class="r" title="${esc(k)}"><span>${esc(nice(k))}</span><b>${fmtN(v)}</b></div>`;
+  const head=items.slice(0,8).map(row).join(''), tail=items.slice(8);
+  return `<div class="cat" style="--c:${c.c}"><h4><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[c.i]}</svg>${c.t}</h4>${head}${tail.length?`<details><summary>ещё ${tail.length}</summary>${tail.map(row).join('')}</details>`:''}</div>`;
+}
 const dur=v=>v>=3600?fmtN(Math.round(v/3600))+' ч':v>=60?fmtN(Math.round(v/60))+' мин':fmtN(v)+' с';
 function statsHTML(d){
   const S=d.stats||{}, m=d.m, used=new Set();
@@ -356,9 +391,10 @@ function statsHTML(d){
     }).join('');
     return rows?`<div class="cat" style="--c:${c.c}"><h4><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[c.i]}</svg>${c.t}</h4>${rows}</div>`:'';
   }).join('');
-  const rest=Object.keys(S).filter(k=>!used.has(k)).sort();
-  const more=rest.length?`<details class="more"><summary>Остальная статистика (${rest.length})</summary>${rest.map(k=>`<div class="r"><code>${esc(k)}</code><b class="mono">${fmtN(S[k])}</b></div>`).join('')}</details>`:'';
-  return sum+`<div class="cats">${cats}</div>`+more;
+  const groups=EXTRA.map(()=>[]);
+  Object.keys(S).filter(k=>!used.has(k)&&Number(S[k])>0).forEach(k=>{groups[EXTRA.findIndex(c=>c.re.test(k))].push([k,S[k]])});
+  const extra=EXTRA.map((c,i)=>groups[i].length?extraCard(c,groups[i].sort((a,b)=>b[1]-a[1])):'').join('');
+  return sum+`<div class="cats">${cats}${extra}</div>`;
 }
 
 /* ---------- рекламные баннеры ---------- */
@@ -685,8 +721,8 @@ async function loadMine(){
 $('#wf').addEventListener('submit',async e=>{
   e.preventDefault(); const el=$('#wPrev'); el.innerHTML='<p class="load">Ищем сервер…</p>';
   try{
-    const s=await api('/api/srv/search?q='+encodeURIComponent($('#wq').value));
-    el.innerHTML=wipeCard(s,s.following?'<span class="note">Уже в вашем списке</span>':'<button class="btn" data-act="follow">Добавить в мои серверы</button>'); tick();
+    const list=await api('/api/srv/search?q='+encodeURIComponent($('#wq').value));
+    el.innerHTML=(list.length>1?'<p class="note">Найдено несколько серверов, выберите нужный.</p>':'')+list.map(s=>wipeCard(s,s.following?'<span class="note">Уже в вашем списке</span>':'<button class="btn" data-act="follow">Добавить в мои серверы</button>')).join(''); tick();
   }catch(x){el.innerHTML='<p class="err">'+esc(x.message)+'</p>'}
 });
 $('#p-wipes').addEventListener('click',async e=>{

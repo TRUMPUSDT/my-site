@@ -699,20 +699,32 @@ def bm_server(sid, fresh=False):
     return p
 
 
-def bm_resolve(q):
-    """Ссылка BattleMetrics, числовой ID или IP:порт -> данные сервера Rust."""
-    q = (q or '').strip()
+def bm_find(q):
+    """Ссылка BattleMetrics, ID, IP:порт, «connect IP:порт» или название -> список серверов Rust."""
+    q = re.sub(r'^\s*connect\s+', '', (q or '').strip(), flags=re.I).strip(' "\'')
+    if not q:
+        return []
     m = re.search(r'battlemetrics\.com/servers/[\w-]+/(\d+)', q) or re.fullmatch(r'(\d{3,9})', q)
     if m:
-        return bm_server(m.group(1))
-    m = re.fullmatch(r'([\w.-]+?)(?::(\d{2,5}))?', q)
-    if not m:
-        return None
-    host, port = m.group(1), int(m.group(2) or 28015)
-    lst = bm_get('/servers', {'filter[game]': 'rust', 'filter[search]': host, 'page[size]': 25}).get('data', [])
-    pick = next((x for x in lst if x['attributes'].get('port') == port), None) or \
-        next((x for x in lst if x['attributes'].get('port') in (port - 1, port + 1)), None)
-    return bm_parse(pick) if pick else None
+        p = bm_server(m.group(1))
+        return [p] if p else []
+    m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?', q)
+    if m:
+        host, port = m.group(1), (int(m.group(2)) if m.group(2) else None)
+        lst = []
+        for term in ([host + ':' + str(port)] if port else []) + [host]:
+            lst = bm_get('/servers', {'filter[game]': 'rust', 'filter[search]': term, 'page[size]': 25}).get('data', [])
+            lst = [x for x in lst if (x.get('attributes') or {}).get('ip') == host]
+            if lst:
+                break
+        if port:
+            lst = [x for x in lst if x['attributes'].get('port') == port] or \
+                  [x for x in lst if x['attributes'].get('port') in (port - 1, port + 1)] or lst
+        res = [bm_parse(x) for x in lst[:8]]
+    else:
+        lst = bm_get('/servers', {'filter[game]': 'rust', 'filter[search]': q, 'page[size]': 8}).get('data', [])
+        res = [bm_parse(x) for x in lst]
+    return [r for r in res if r]
 
 
 def apply_server(p):
@@ -1125,15 +1137,18 @@ class Handler(BaseHTTPRequestHandler):
             if MULTI and not rate_ok(('bm', user['sid']), 10):
                 return self.send(429, {'error': 'Слишком много поисков серверов, подождите минуту.'})
             try:
-                p = bm_resolve(Q.get('q'))
+                found = bm_find(Q.get('q'))
             except Exception:
                 return self.send(502, {'error': 'BattleMetrics не ответил. Попробуйте позже.'})
-            if not p:
-                return self.send(404, {'error': 'Сервер Rust не найден. Дайте ссылку BattleMetrics или IP:порт.'})
+            if not found:
+                return self.send(404, {'error': 'Сервер не найден. Попробуйте название сервера или откройте battlemetrics.com, найдите сервер и вставьте ссылку на его страницу (вида battlemetrics.com/servers/rust/12345).'})
+            out = []
             with lock:
-                sv = dict(db['servers'].get(p['id'], {'id': p['id'], 'schedule': {'kind': 'force'}}))
-                sv.update({k: p[k] for k in ('name', 'addr', 'players', 'max', 'status', 'country', 'modded', 'type', 'last_wipe')})
-                return self.send(200, srv_view(sv, user))
+                for p in found:
+                    sv = dict(db['servers'].get(p['id'], {'id': p['id'], 'schedule': {'kind': 'force'}}))
+                    sv.update({k: p[k] for k in ('name', 'addr', 'players', 'max', 'status', 'country', 'modded', 'type', 'last_wipe')})
+                    out.append(srv_view(sv, user))
+            return self.send(200, out)
 
         if P == '/api/srv/mine':
             with lock:
