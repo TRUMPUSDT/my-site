@@ -3,7 +3,7 @@
 Два режима:
   локальный  (PUBLIC_URL пуст): один пользователь, без входа, как раньше;
   публичный  (PUBLIC_URL задан): вход через Steam, у каждого свой список слежки и свой Telegram."""
-import atexit, base64, hmac, json, os, re, secrets, sys, threading, time, uuid
+import atexit, base64, hmac, ipaddress, json, os, re, secrets, socket, sys, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -61,6 +61,7 @@ TZ = E.get('TZ_NAME') or 'Europe/Warsaw'
 RUST = '252490'
 BASE = 76561197960265728
 BOT_USERNAME = None
+APP_VERSION = '2026.11.22-a2s-design'   # показывается внизу слева на сайте: по ней видно, что загружена новая версия
 LOCAL_USER = {'sid': 'local', 'name': 'Локальный режим', 'avatar': ''}
 try:
     TZI = ZoneInfo(TZ) if ZoneInfo else None
@@ -612,6 +613,17 @@ def first_thursday_ts(y, m):
     return int(datetime(y, m, d, 18 if dst else 19, tzinfo=timezone.utc).timestamp())
 
 
+def prev_force_wipe_ts(before=None):
+    before = now() if before is None else before
+    d = datetime.fromtimestamp(before, timezone.utc)
+    y, m = d.year, d.month
+    for _ in range(3):
+        ts = first_thursday_ts(y, m)
+        if ts <= before:
+            return ts
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+
+
 def force_wipe_ts(after=None):
     after = now() if after is None else after
     d = datetime.fromtimestamp(after, timezone.utc)
@@ -699,8 +711,113 @@ def bm_server(sid, fresh=False):
     return p
 
 
-def bm_find(q):
-    """Ссылка BattleMetrics, ID, IP:порт, «connect IP:порт» или название -> список серверов Rust."""
+class FindError(Exception):
+    """Понятное пользователю сообщение: почему сервер не найден."""
+
+
+def is_public_ip(ip):
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
+
+
+def parse_a2s(b):
+    """Разбор ответа A2S_INFO (Valve Source Query)."""
+    def cstr(i):
+        j = b.index(b'\x00', i)
+        return b[i:j].decode('utf-8', 'replace'), j + 1
+    name, i = cstr(1)
+    _, i = cstr(i)                       # карта
+    folder, i = cstr(i)
+    game, i = cstr(i)
+    i += 2                               # app id
+    players, maxp = b[i], b[i + 1]
+    i += 3                               # игроки, максимум, боты
+    i += 4                               # тип, ОС, пароль, VAC
+    _, i = cstr(i)                       # версия
+    edf = b[i]
+    i += 1
+    kw = ''
+    if edf & 0x80:
+        i += 2
+    if edf & 0x10:
+        i += 8
+    if edf & 0x40:
+        i += 2
+        _, i = cstr(i)
+    if edf & 0x20:
+        kw, _ = cstr(i)
+    return {'name': clean(name, 120), 'folder': folder, 'game': game, 'players': players, 'max': maxp, 'kw': kw}
+
+
+def a2s_info(ip, port, timeout=2.0):
+    req = b'\xff\xff\xff\xffTSource Engine Query\x00'
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(req, (ip, port))
+        data, _ = sock.recvfrom(65535)
+        if data[4:5] == b'A':            # сервер просит подтвердить запрос (challenge)
+            sock.sendto(req + data[5:9], (ip, port))
+            data, _ = sock.recvfrom(65535)
+        if data[:4] != b'\xff\xff\xff\xff' or data[4:5] != b'I':
+            return None
+        return parse_a2s(data[5:])
+    except (OSError, ValueError, IndexError):
+        return None
+    finally:
+        sock.close()
+
+
+def rust_tags(kw):
+    """Теги Rust в ответе сервера: mp, cp, qp, born (время создания карты, то есть вайпа), weekly/biweekly/monthly."""
+    t = kw.split(',')
+
+    def num(pref):
+        for x in t:
+            if x.startswith(pref) and x[len(pref):].isdigit():
+                return int(x[len(pref):])
+    low = [x.lower() for x in t]
+    cad = next((c for c in ('biweekly', 'bi-weekly', 'weekly', 'monthly') if c in low), None)
+    return {'mp': num('mp'), 'cp': num('cp'), 'born': num('born'), 'cadence': 'biweekly' if cad == 'bi-weekly' else cad,
+            'modded': any(x in low for x in ('modded', 'oxide', 'carbon'))}
+
+
+def a2s_server(host, gport, qhint=None):
+    """Опрашивает сервер Rust напрямую. Порт запросов обычно на 1 больше игрового, пробуем несколько."""
+    if re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', host):
+        ip = host
+    else:
+        try:
+            ip = socket.gethostbyname(host)
+        except OSError:
+            raise FindError('Адрес %s не найден. Проверьте название.' % host)
+    if not is_public_ip(ip):
+        raise FindError('Этот адрес не подходит: нужен публичный сервер.')
+    ports = [x for x in dict.fromkeys([qhint, gport + 1, gport, gport + 2, gport - 1]) if x and 1024 <= x <= 65535]
+    info = qport = None
+    for pt, r in zip(ports, pool.map(lambda x: a2s_info(ip, x), ports)):
+        if r:
+            info, qport = r, pt
+            break
+    if not info:
+        return None
+    tags = rust_tags(info['kw'])
+    if 'rust' not in (info['folder'] + info['game']).lower() and tags['born'] is None:
+        raise FindError('Это не сервер Rust.')
+    return {'id': 'a2s-%s-%d' % (ip, gport), 'kind': 'a2s', 'host': host, 'gport': gport, 'qport': qport,
+            'name': info['name'], 'addr': '%s:%d' % (host, gport), 'players': tags['cp'] if tags['cp'] is not None else info['players'],
+            'max': tags['mp'] if tags['mp'] is not None else info['max'], 'status': 'online', 'country': '',
+            'last_wipe': tags['born'], 'modded': tags['modded'], 'type': tags['cadence'] or '', 'size': None, 'desc': ''}
+
+
+SRV_ID_RE = re.compile(r'\d{3,9}|a2s-\d{1,3}(?:\.\d{1,3}){3}-\d{2,5}')
+srv_cache = {}
+
+
+def find_servers(q):
+    """Адрес из игры («connect IP:порт»), IP:порт, домен:порт, название или ссылка BattleMetrics -> список серверов."""
     q = re.sub(r'^\s*connect\s+', '', (q or '').strip(), flags=re.I).strip(' "\'')
     if not q:
         return []
@@ -708,23 +825,30 @@ def bm_find(q):
     if m:
         p = bm_server(m.group(1))
         return [p] if p else []
-    m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?', q)
-    if m:
-        host, port = m.group(1), (int(m.group(2)) if m.group(2) else None)
-        lst = []
-        for term in ([host + ':' + str(port)] if port else []) + [host]:
-            lst = bm_get('/servers', {'filter[game]': 'rust', 'filter[search]': term, 'page[size]': 25}).get('data', [])
-            lst = [x for x in lst if (x.get('attributes') or {}).get('ip') == host]
-            if lst:
-                break
-        if port:
-            lst = [x for x in lst if x['attributes'].get('port') == port] or \
-                  [x for x in lst if x['attributes'].get('port') in (port - 1, port + 1)] or lst
-        res = [bm_parse(x) for x in lst[:8]]
-    else:
+    m = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9-]+|\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?', q)
+    if m:                                             # адрес: опрашиваем сервер напрямую, сторонние сайты не нужны
+        p = a2s_server(m.group(1).lower(), int(m.group(2) or 28015))
+        if not p:
+            raise FindError('Сервер %s:%s не отвечает на запросы. Проверьте порт из строки connect в игре. Если порта нет в адресе, впишите его: адрес:порт.' % (m.group(1), m.group(2) or 28015))
+        srv_cache[p['id']] = (time.time() + 600, p)
+        return [p]
+    try:                                              # название: ищем через BattleMetrics
         lst = bm_get('/servers', {'filter[game]': 'rust', 'filter[search]': q, 'page[size]': 8}).get('data', [])
-        res = [bm_parse(x) for x in lst]
-    return [r for r in res if r]
+    except Exception:
+        raise FindError('Поиск по названию сейчас недоступен. Вставьте адрес сервера из игры (строка connect).')
+    return [r for r in (bm_parse(x) for x in lst) if r]
+
+
+def refresh_server(sv_id, sv=None):
+    """Свежие данные сервера: напрямую для a2s-серверов, через BattleMetrics для остальных."""
+    sv = sv or {}
+    if sv_id.startswith('a2s-'):
+        c = srv_cache.get(sv_id)
+        if c and c[0] > time.time():
+            return c[1]
+        _, ip, port = sv_id.split('-')
+        return a2s_server(sv.get('host') or ip, int(sv.get('gport') or port), sv.get('qport'))
+    return bm_server(sv_id, fresh=True)
 
 
 def apply_server(p):
@@ -736,7 +860,7 @@ def apply_server(p):
         wiped = bool(old and new and new > old + 60)
         if wiped:
             sv['wipes'] = (sv.get('wipes', []) + [new])[-30:]
-        for k in ('name', 'addr', 'players', 'max', 'status', 'country', 'modded', 'type', 'size'):
+        for k in ('name', 'addr', 'players', 'max', 'status', 'country', 'modded', 'type', 'size', 'kind', 'host', 'gport', 'qport'):
             sv[k] = p.get(k)
         if new or not old:
             sv['last_wipe'] = new
@@ -760,8 +884,9 @@ def notify_wipes(ids):
         sv = db['servers'].get(i)
         if not sv:
             continue
-        text = '🧹 <b>%s</b> вайпнулся\nПоследний вайп: %s UTC\nhttps://www.battlemetrics.com/servers/rust/%s' % (
-            hesc(sv['name']), datetime.fromtimestamp(sv['last_wipe'], timezone.utc).strftime('%d.%m %H:%M'), i)
+        text = '🧹 <b>%s</b> вайпнулся\nПоследний вайп: %s UTC\n%s' % (
+            hesc(sv['name']), datetime.fromtimestamp(sv['last_wipe'], timezone.utc).strftime('%d.%m %H:%M'),
+            'connect ' + sv['addr'] if i.startswith('a2s-') else 'https://www.battlemetrics.com/servers/rust/' + i)
         for sid, m in list(db['myservers'].items()):
             if i in m and m[i].get('alert', True):
                 chat = chat_of(sid)
@@ -777,27 +902,35 @@ def poll_servers():
         wiped = []
         for i in ids:
             try:
-                p = bm_parse(bm_get('/servers/' + i)['data'])
+                with lock:
+                    old = dict(db['servers'][i])
+                srv_cache.pop(i, None)
+                p = refresh_server(i, old)
                 if p and apply_server(p):
                     wiped.append(i)
             except Exception as e:
                 print('server %s: %s' % (i, e), file=sys.stderr)
-            time.sleep(1.2)                               # не превышаем лимиты BattleMetrics
+            if not i.startswith('a2s-'):
+                time.sleep(1.2)                           # не превышаем лимиты BattleMetrics
         notify_wipes(wiped)
     except Exception as e:
         print('servers:', e, file=sys.stderr)
 
 
 def guess_wipe(sv):
-    """Свой ритм сервера по замеченным вайпам: нужно минимум 3 вайпа с почти одинаковыми интервалами."""
+    """Свой вайп сервера: по замеченной истории или по типу вайпов (weekly/biweekly), примерно."""
     w = sv.get('wipes') or []
-    if len(w) < 3:
-        return None
-    gaps = [b - a for a, b in zip(w, w[1:])][-4:]
-    if max(gaps) - min(gaps) > 1.5 * 86400 or not 3 * 86400 <= sum(gaps) / len(gaps) <= 35 * 86400:
-        return None
-    g = w[-1] + int(sum(gaps) / len(gaps))
-    return g if g > now() else None
+    if len(w) >= 3:
+        gaps = [b - a for a, b in zip(w, w[1:])][-4:]
+        if max(gaps) - min(gaps) <= 1.5 * 86400 and 3 * 86400 <= sum(gaps) / len(gaps) <= 35 * 86400:
+            g = w[-1] + int(sum(gaps) / len(gaps))
+            if g > now():
+                return g
+    period = {'weekly': 7, 'biweekly': 14}.get((sv.get('type') or '').lower())
+    if period and sv.get('last_wipe'):
+        g = sv['last_wipe'] + period * 86400
+        return g if g > now() else None
+    return None
 
 
 def srv_view(sv, user=None):
@@ -975,7 +1108,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.user()
         if P == '/api/me':
             chat = user_chat(user) if user else None
-            me = {'mode': 'multi' if MULTI else 'local', 'user': None, 'tz': TZ, 'pollSec': POLL_SEC, 'banMin': BAN_MIN,
+            me = {'version': APP_VERSION, 'mode': 'multi' if MULTI else 'local', 'user': None, 'tz': TZ, 'pollSec': POLL_SEC, 'banMin': BAN_MIN,
                   'maxWatch': MAX_WATCH, 'telegram': {'configured': bool(TG_TOKEN), 'linked': bool(chat), 'bot': BOT_USERNAME}}
             if user:
                 me['user'] = {'sid': user['sid'], 'name': user['name'], 'avatar': user.get('avatar', ''),
@@ -1131,17 +1264,19 @@ class Handler(BaseHTTPRequestHandler):
 
         # --- вайпы ---
         if P == '/api/wipe':
-            return self.send(200, {'force': force_wipe_ts(), 'now': now()})
+            return self.send(200, {'force': force_wipe_ts(), 'prev': prev_force_wipe_ts(), 'now': now()})
 
         if P == '/api/srv/search':
             if MULTI and not rate_ok(('bm', user['sid']), 10):
                 return self.send(429, {'error': 'Слишком много поисков серверов, подождите минуту.'})
             try:
-                found = bm_find(Q.get('q'))
+                found = find_servers(Q.get('q'))
+            except FindError as e:
+                return self.send(404, {'error': str(e)})
             except Exception:
-                return self.send(502, {'error': 'BattleMetrics не ответил. Попробуйте позже.'})
+                return self.send(502, {'error': 'Не удалось связаться с сервером. Попробуйте позже.'})
             if not found:
-                return self.send(404, {'error': 'Сервер не найден. Попробуйте название сервера или откройте battlemetrics.com, найдите сервер и вставьте ссылку на его страницу (вида battlemetrics.com/servers/rust/12345).'})
+                return self.send(404, {'error': 'Сервер не найден. Вставьте адрес из игры (строка connect IP:порт).'})
             out = []
             with lock:
                 for p in found:
@@ -1162,7 +1297,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if P == '/api/srv/follow' and method == 'POST':
             i = str(self.jbody().get('id', ''))
-            if not re.fullmatch(r'\d{3,9}', i):
+            if not SRV_ID_RE.fullmatch(i):
                 return self.send(400, {'error': 'Некорректный сервер'})
             with lock:
                 mine = db['myservers'].setdefault(user['sid'], {})
@@ -1174,7 +1309,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not known and len(db['servers']) >= MAX_SERVERS:
                     return self.send(400, {'error': 'Достигнут общий лимит серверов на сайте.'})
             if not known:
-                p = bm_server(i)
+                try:
+                    c = srv_cache.get(i)
+                    p = c[1] if c and c[0] > time.time() else refresh_server(i)
+                except FindError as e:
+                    return self.send(404, {'error': str(e)})
+                except Exception:
+                    return self.send(502, {'error': 'Не удалось связаться с сервером. Попробуйте позже.'})
                 if not p:
                     return self.send(404, {'error': 'Сервер Rust не найден'})
                 apply_server(p)
@@ -1213,7 +1354,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if P == '/api/srv/claim' and method == 'POST':
             i = str(self.jbody().get('id', ''))
-            if not re.fullmatch(r'\d{3,9}', i):
+            if not re.fullmatch(r'\d{3,9}', i):          # подтверждение владельца работает через BattleMetrics
                 return self.send(400, {'error': 'Некорректный сервер'})
             with lock:
                 code = 'rtv-' + secrets.token_hex(4)
