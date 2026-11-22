@@ -1,0 +1,14 @@
+{
+  "_help": "contact: ваш Telegram для кнопки «Забронировать». position: home (главная под поиском) или profile (внизу профиля). image и url только https. from/until необязательны, формат ГГГГ-ММ-ДД. Размер картинки 1200x400.",
+  "contact": "@ваш_ник",
+  "slots": [
+    {
+      "position": "profile",
+      "image": "https://example.com/banner.jpg",
+      "url": "https://example.com",
+      "title": "Название сервера",
+      "from": "2026-01-01",
+      "until": "2026-01-31"
+    }
+  ]
+}

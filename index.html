@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Tracker: профили и слежка по Steam ID</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🪓</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil:wght@800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --asphalt:#1b1d1c; --plate:#262927; --plate2:#2f3331; --line:#3d423f;
+  --bone:#e3dccb; --dim:#9a9a8e; --rust:#c25a2b; --moss:#7a9a5b; --hazard:#d6a72a; --blood:#c8433a;
+  --stencil:'Big Shoulders Stencil',Impact,'Arial Narrow Bold',sans-serif;
+  --body:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--asphalt);color:var(--bone);font:400 15px/1.5 var(--body)}
+a{color:var(--bone)}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--hazard);outline-offset:2px}
+.app{display:grid;grid-template-columns:300px 1fr;min-height:100vh}
+aside{background:var(--plate);border-right:1px solid var(--line);padding:24px 18px;display:flex;flex-direction:column;gap:12px;max-height:100vh;overflow:auto;position:sticky;top:0}
+.logo{font:800 34px/0.95 var(--stencil);letter-spacing:.02em;color:var(--rust);margin:0}
+aside h2{font:600 15px var(--body);margin:10px 0 0;color:var(--dim)}
+.watch{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.gh{margin-top:8px;display:flex;justify-content:space-between;gap:8px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:3px}
+.gh small{color:var(--dim)}
+.w{display:grid;grid-template-columns:36px 1fr;gap:10px;align-items:center;padding:8px;background:var(--plate2);border-left:3px solid var(--line);cursor:pointer}
+.w.on{border-left-color:var(--moss)} .w.rust{border-left-color:var(--rust)}
+.w img{width:36px;height:36px;display:block;background:var(--asphalt)}
+.w b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.w small{color:var(--dim);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.w.rust small{color:var(--rust)}
+.hint{color:var(--dim);font-size:13px;margin:0}
+main{padding:24px clamp(16px,4vw,56px) 60px;max-width:1120px}
+nav{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:26px}
+.tab{background:none;border:0;padding:10px 16px;cursor:pointer;color:var(--dim);border-bottom:3px solid transparent;margin-bottom:-1px;font-weight:500}
+.tab:hover{color:var(--bone)}
+.tab.on{color:var(--bone);border-bottom-color:var(--rust)}
+h1{font:800 clamp(38px,6vw,68px)/0.95 var(--stencil);margin:0 0 6px;letter-spacing:.01em}
+.sub{color:var(--dim);margin:0 0 22px;max-width:62ch}
+form,.row{display:flex;gap:8px;max-width:680px;margin-bottom:10px}
+input[type=text],select,textarea{flex:1;min-width:0;background:var(--plate);border:1px solid var(--line);padding:11px 13px}
+textarea{width:100%;max-width:680px;resize:vertical;display:block}
+input::placeholder,textarea::placeholder{color:#767a72}
+.btn{background:var(--rust);color:#fff;border:0;padding:0 22px;font-weight:600;cursor:pointer;min-height:42px}
+.btn:hover{background:#d4683a}
+.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--bone);padding:8px 14px;min-height:0}
+.btn.ghost:hover{border-color:var(--bone)}
+.err{color:var(--blood);margin:16px 0 0}
+.ok{color:var(--moss)}
+.card{background:var(--plate);border:1px solid var(--line)}
+.head{display:grid;grid-template-columns:128px 1fr auto;gap:22px;padding:22px;border-bottom:1px solid var(--line);align-items:start}
+.head img{width:128px;height:128px;display:block;background:var(--asphalt)}
+.head h2{font:800 36px/1 var(--stencil);margin:0 0 6px;word-break:break-word}
+.meta{color:var(--dim);margin:2px 0}
+.mono{font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:3px 10px;font-weight:600;font-size:13px;background:var(--plate2);border:1px solid var(--line);margin:6px 8px 0 0}
+.pill.on{border-color:var(--moss);color:var(--moss)}
+.pill.bad{border-color:var(--blood);color:var(--blood)}
+.pill.warn{border-color:var(--hazard);color:var(--hazard)}
+.stamp{font:800 26px var(--stencil);color:var(--rust);border:3px solid var(--rust);padding:6px 14px;transform:rotate(-5deg);letter-spacing:.05em;align-self:center}
+.sec{padding:22px;border-bottom:1px solid var(--line)}
+.sec:last-child{border-bottom:0}
+.sec h3{font:600 17px var(--body);margin:0 0 14px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.t{background:var(--plate2);padding:12px 14px;border-top:3px solid var(--line)}
+.t.hi{border-top-color:var(--rust)}
+.t span{display:block;color:var(--dim);font-size:13px}
+.t b{font:800 30px/1.1 var(--stencil);letter-spacing:.02em}
+.recent{display:flex;flex-wrap:wrap;gap:8px}
+.recent span{background:var(--plate2);padding:6px 12px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.note{color:var(--dim);font-size:13px;margin:12px 0 0}
+.load{color:var(--dim);margin-top:24px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.chip{background:var(--plate2);border:1px solid var(--rust);padding:3px 10px;cursor:pointer;font-size:13px}
+.chip:hover{border-color:var(--blood)}
+.chk{display:flex;gap:8px;align-items:center;margin:12px 0}
+.lbl{color:var(--dim);font-size:13px;margin:12px 0 4px}
+.names{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:3px}
+.names span{color:var(--dim)}
+/* график онлайна */
+.seg{display:inline-flex;border:1px solid var(--line);margin-bottom:10px}
+.seg button{background:none;border:0;padding:6px 14px;cursor:pointer;color:var(--dim)}
+.seg button.on{background:var(--plate2);color:var(--bone)}
+.heat{display:grid;grid-template-columns:26px repeat(24,minmax(0,1fr));gap:2px;max-width:760px;font-size:11px;color:var(--dim);align-items:center}
+.heat i{display:block;height:20px;background:color-mix(in srgb,var(--c) calc(var(--a)*100%),var(--plate2))}
+.heat u{text-decoration:none;text-align:left;height:14px}
+.log{margin:14px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:3px;font-size:14px}
+.log time{color:var(--dim);margin-right:10px}
+/* таблицы */
+.tbl{width:100%;border-collapse:collapse;max-width:900px}
+.tbl th,.tbl td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line)}
+.tbl th{font-weight:600;color:var(--dim)}
+.tbl td.n{font-variant-numeric:tabular-nums}
+.tbl .win{color:var(--hazard);font-weight:600}
+.who{display:flex;align-items:center;gap:10px}
+.who img{width:36px;height:36px}
+.cmphead{display:flex;align-items:center;gap:10px;font:800 24px var(--stencil)}
+.cmphead img{width:48px;height:48px}
+.srv{background:var(--plate);border:1px solid var(--line);padding:16px 18px;margin-bottom:12px;max-width:900px}
+.srv h3{margin:0 0 2px;font:600 17px var(--body)}
+dialog{background:var(--plate);color:var(--bone);border:1px solid var(--line);padding:18px;max-width:min(1040px,96vw)}
+dialog::backdrop{background:rgba(0,0,0,.7)}
+dialog canvas{width:100%;height:auto;display:block;margin-bottom:12px}
+#login{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;gap:10px}
+#login .logo{font-size:64px}
+#me{margin-top:auto;border-top:1px solid var(--line);padding-top:12px;display:flex;gap:10px;align-items:center}
+#me img{width:32px;height:32px}
+#me div{min-width:0;flex:1}
+#me b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#me .x{padding:0;color:var(--dim);background:none;border:0;cursor:pointer;text-decoration:underline;font-size:13px}
+/* карточки статистики */
+.sumrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-top:12px}
+.sumrow .t{text-align:center;border-top:0;background:var(--plate2);border-bottom:3px solid var(--line)}
+.sumrow .t.k{border-bottom-color:var(--blood)}
+.sumrow .t b{font-size:34px}
+.cats{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px;margin-top:16px;align-items:start}
+.cat{background:var(--plate2);border-top:3px solid var(--c);padding:16px 18px 10px}
+.cat h4{display:flex;align-items:center;gap:10px;margin:0 0 8px;font:800 20px/1 var(--stencil);letter-spacing:.06em;text-transform:uppercase}
+.cat h4 svg{width:30px;height:30px;padding:5px;border:1px solid var(--c);color:var(--c);fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.cat .r{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--line)}
+.cat .r:first-of-type{border-top:0}
+.cat .r span{color:var(--dim)}
+.cat .r b{font-variant-numeric:tabular-nums}
+details.more{margin-top:16px}
+details.more summary{cursor:pointer;color:var(--dim)}
+details.more .r{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid var(--line);max-width:560px}
+details.more code{color:var(--dim);font-size:13px}
+/* реклама */
+.ad{display:block;position:relative;margin-top:20px;max-width:1000px}
+.ad img{display:block;width:100%;aspect-ratio:3/1;object-fit:cover;border:1px solid var(--line)}
+.adtag{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);color:var(--dim);font-size:11px;padding:2px 8px}
+.ad.empty{border:2px dashed var(--line);padding:26px 20px;text-align:center;color:var(--dim)}
+.ad.empty b{display:block;color:var(--bone);margin-bottom:4px}
+.ad.empty p{margin:0 0 14px;font-size:13px}
+.ad.empty .btn{display:inline-flex;align-items:center;text-decoration:none}
+@media (max-width:820px){
+  .app{grid-template-columns:1fr}
+  aside{position:static;max-height:none;border-right:0;border-bottom:1px solid var(--line)}
+  .head{grid-template-columns:84px 1fr}
+  .head img{width:84px;height:84px}
+  .stamp{grid-column:1/-1;justify-self:start}
+  .tbl{display:block;overflow-x:auto}
+}
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <p class="logo">Rust<br>Tracker</p>
+  <p class="sub" style="margin:0">Слежка за игроками Rust: профили, онлайн, баны и оповещения в Telegram.</p>
+  <a class="btn" style="display:inline-flex;align-items:center;margin-top:12px" href="/auth/login">Войти через Steam</a>
+  <p class="hint" style="max-width:46ch">Пароль Steam мы не видим: вход идёт на сайте Steam. Читайте <a href="/privacy">политику конфиденциальности</a>.</p>
+</div>
+<div class="app" id="app">
+  <aside>
+    <p class="logo">Rust<br>Tracker</p>
+    <h2>Слежка</h2>
+    <ul class="watch" id="watch"></ul>
+    <p class="hint" id="watchHint">Пока пусто. Найдите игрока и нажмите «Следить»: сервер будет записывать его онлайн, ники и баны.</p>
+  <div id="me" hidden></div>
+  </aside>
+  <main>
+    <nav>
+      <button class="tab on" data-tab="profile">Профиль</button>
+      <button class="tab" data-tab="compare">Сравнение</button>
+      <button class="tab" data-tab="rating">Рейтинг</button>
+      <button class="tab" data-tab="servers">Серверы</button>
+      <button class="tab" data-tab="settings">Настройки</button>
+    </nav>
+
+    <section class="pane" id="p-profile">
+      <h1>Профиль игрока Rust</h1>
+      <p class="sub">Вставьте SteamID64, ссылку на профиль, STEAM_0:X:Y или ник из ссылки.</p>
+      <form id="f">
+        <input type="text" id="q" placeholder="76561198000000000 или steamcommunity.com/id/ник" autocomplete="off" required>
+        <button class="btn" type="submit">Найти</button>
+      </form>
+      <div id="adHome"></div>
+      <div id="out"></div>
+    </section>
+
+    <section class="pane" id="p-compare" hidden>
+      <h1>Сравнение</h1>
+      <p class="sub">Два игрока рядом. Лучшее значение подсвечено.</p>
+      <form id="cf" style="flex-wrap:wrap">
+        <input type="text" id="cmpA" placeholder="Игрок A: SteamID или ссылка" required>
+        <input type="text" id="cmpB" placeholder="Игрок B: SteamID или ссылка" required>
+        <button class="btn" type="submit">Сравнить</button>
+      </form>
+      <div id="cmpOut"></div>
+    </section>
+
+    <section class="pane" id="p-rating" hidden>
+      <h1>Рейтинг</h1>
+      <p class="sub">Только игроки из слежки. Данные берутся из открытой статистики Steam.</p>
+      <div class="row">
+        <select id="ratSort">
+          <option value="hours">По часам в Rust</option>
+          <option value="kd">По K/D</option>
+          <option value="kills">По убийствам</option>
+          <option value="hs">По хедшотам</option>
+          <option value="acc">По точности</option>
+        </select>
+        <select id="ratGroup"><option value="">Все группы</option></select>
+      </div>
+      <div id="ratOut"></div>
+    </section>
+
+    <section class="pane" id="p-servers" hidden>
+      <h1>Серверы</h1>
+      <p class="sub">На каких серверах Rust сейчас сидят игроки из слежки.</p>
+      <div id="srvOut"></div>
+    </section>
+
+    <section class="pane" id="p-settings" hidden>
+      <h1>Настройки</h1>
+      <div id="setOut"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="dlg">
+  <canvas id="cv" width="1000" height="520"></canvas>
+  <div class="actions" style="margin-top:0">
+    <button class="btn" id="sendTg" type="button">Отправить в Telegram</button>
+    <a class="btn ghost" id="dlPng" download="rust-card.png">Скачать PNG</a>
+    <button class="btn ghost" id="closeDlg" type="button">Закрыть</button>
+  </div>
+  <p class="note" id="shareMsg"></p>
+</dialog>
+
+<datalist id="grpList"></datalist>
+<datalist id="tagSug"><option value="тиммейт"><option value="читер?"><option value="друг"><option value="враг"><option value="клан"></datalist>
+
+<script>
+const RUST='252490';
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATE=['не в сети','в сети','не беспокоить','нет на месте','спит','хочет обмен','хочет играть'];
+const DAYS=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+const fmtN=n=>n==null?'—':Number(n).toLocaleString('ru-RU');
+const hrs=m=>m==null?'—':fmtN(Math.round(m/60))+' ч';
+const date=ts=>ts?new Date(ts*1000).toLocaleDateString('ru-RU',{year:'numeric',month:'long',day:'numeric'}):'—';
+const dt=ts=>new Date(ts*1000).toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+const safeUrl=u=>/^https:\/\/steamcommunity\.com\//.test(u||'')?u:'#';
+const S={cfg:{},cur:null,hist:null,tracked:[],heat:'online',rows:[]};
+
+async function api(u,body){
+  const o=body!==undefined?{method:'POST',headers:{'x-rt':'1','content-type':'application/json'},body:JSON.stringify(body)}:{};
+  const r=await fetch(u,o); let d={};
+  try{d=await r.json()}catch{}
+  if(r.status===401&&d.login){showLogin();throw new Error(d.error)}
+  if(!r.ok)throw new Error(d.error||'Ошибка сервера');
+  return d;
+}
+
+/* ---------- вкладки ---------- */
+function tab(name){
+  $$('.tab').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));
+  $$('.pane').forEach(p=>p.hidden=p.id!=='p-'+name);
+  if(name==='rating')loadRating();
+  if(name==='servers')loadServers();
+  if(name==='settings')renderSettings();
+}
+$('nav').addEventListener('click',e=>{const b=e.target.closest('.tab');if(b)tab(b.dataset.tab)});
+
+/* ---------- боковая панель ---------- */
+async function loadTracked(){
+  try{S.tracked=await api('/api/tracked')}catch{return}
+  const groups=[...new Set(S.tracked.map(p=>p.group).filter(Boolean))].sort();
+  $('#grpList').innerHTML=groups.map(g=>`<option value="${esc(g)}">`).join('');
+  const sel=$('#ratGroup'), cur=sel.value;
+  sel.innerHTML='<option value="">Все группы</option>'+groups.map(g=>`<option ${g===cur?'selected':''} value="${esc(g)}">${esc(g)}</option>`).join('');
+  renderSide();
+}
+function renderSide(){
+  const list=S.tracked, el=$('#watch');
+  $('#watchHint').hidden=list.length>0;
+  const by={};
+  for(const p of list)(by[p.group||'']||(by[p.group||'']=[])).push(p);
+  const names=Object.keys(by).sort((a,b)=>!a?1:!b?-1:a.localeCompare(b,'ru'));
+  el.innerHTML=names.map(g=>{
+    const ps=by[g].sort((a,b)=>rank(b)-rank(a)||a.name.localeCompare(b.name));
+    const on=ps.filter(p=>isOn(p)).length, ru=ps.filter(p=>p.last?.gameid===RUST).length;
+    const head=names.length>1||g?`<li class="gh"><b>${esc(g||'Без группы')}</b><small>${on} в сети · ${ru} в Rust</small></li>`:'';
+    return head+ps.map(p=>{
+      const l=p.last||{}, rust=l.gameid===RUST;
+      const line=rust?('Rust'+(p.serverName?' · '+p.serverName:l.server?' · '+l.server:'')):l.gameid?('в игре: '+(l.game||l.gameid)):(STATE[l.state]??'нет данных');
+      return `<li class="w ${rust?'rust':isOn(p)?'on':''}" data-id="${esc(p.id)}"><img src="${esc(p.avatar)}" alt=""><div><b>${esc(p.name)}</b><small>${esc(line)}</small></div></li>`;
+    }).join('');
+  }).join('');
+}
+const isOn=p=>p.last&&(p.last.state>0||p.last.gameid);
+const rank=p=>p.last?.gameid===RUST?2:isOn(p)?1:0;
+$('#watch').addEventListener('click',e=>{const li=e.target.closest('.w');if(li)lookup(li.dataset.id)});
+
+/* ---------- профиль ---------- */
+async function lookup(q){
+  tab('profile'); $('#q').value=q;
+  $('#out').innerHTML='<p class="load">Запрашиваем Steam…</p>';
+  try{
+    S.cur=await api('/api/player?q='+encodeURIComponent(q)); S.hist=null;
+    renderProfile();
+    history.replaceState(null,'','#'+S.cur.profile.steamid);
+  }catch(e){$('#out').innerHTML='<p class="err">'+esc(e.message)+'</p>'}
+}
+async function reload(){
+  S.cur=await api('/api/player?q='+S.cur.profile.steamid); renderProfile(); loadTracked();
+}
+/* ---------- статистика по категориям ---------- */
+const ICONS={
+  pvp:'<circle cx="12" cy="12" r="7"/><path d="M12 2v5M12 17v5M2 12h5M17 12h5"/>',
+  gun:'<path d="M8 21V10l4-6 4 6v11z"/><path d="M8 15h8"/>',
+  pick:'<path d="M5 20 14 11"/><path d="M10 5c5-1 9 2 9 8-1-3-4-5-9-5z"/>',
+  build:'<path d="M3 11 12 3l9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/>',
+  life:'<path d="M10 14V5a2 2 0 0 1 4 0v9a4 4 0 1 1-4 0z"/><path d="M12 9v6"/>'
+};
+// [подпись, [возможные имена статистики в Steam], 'dur' если это секунды]
+const CATS=[
+ {t:'PvP',c:'var(--blood)',i:'pvp',rows:[['Убийств игроков',['kill_player']],['Смертей',['deaths','death_player']],['Хедшотов',['headshot']],['Ранен',['wounded']],['Поднял раненых',['wounded_assisted','wounded_healed']],['Убийств учёных',['kill_scientist']],['Убийств медведей',['kill_bear']],['Убийств кабанов',['kill_boar']],['Убийств волков',['kill_wolf']],['Убийств оленей',['kill_stag']],['Самоубийств',['death_suicide']]]},
+ {t:'Оружие',c:'var(--rust)',i:'gun',rows:[['Пуль выпущено',['bullet_fired']],['Попаданий по игрокам',['bullet_hit_player']],['Дробовик, выстрелов',['shotgun_fired']],['Попаданий дробовиком',['shotgun_hit_player','shotgun_hit_entity']],['Стрел выпущено',['arrow_fired']],['Попаданий стрелами',['arrow_hit_player','arrow_hit_entity']],['Ракет выпущено',['rocket_fired']],['Гранат брошено',['grenade_thrown']]]},
+ {t:'Ресурсы',c:'var(--moss)',i:'pick',rows:[['Дерево',['harvest.wood']],['Камень',['harvest.stones']],['Метал. руда',['harvest.metal_ore']],['Ткань',['harvest.cloth']],['Металлолом',['acquired_scrap']],['Топливо (LGF)',['acquired_lowgradefuel']],['Бочек сломано',['destroyed_barrels']]]},
+ {t:'Строительство',c:'#5b8db8',i:'build',rows:[['Блоков поставлено',['placed_blocks']],['Блоков улучшено',['upgraded_blocks']],['Чертежей изучено',['blueprint_studied']],['Предметов создано',['item_crafted','crafted_items']],['Предметов осмотрено',['item_inspected','inspected_items']]]},
+ {t:'Выживание',c:'#4ea5a0',i:'life',rows:[['Калорий потреблено',['calories_consumed']],['Воды потреблено',['water_consumed']],['Рад. облучение',['radiation_exposure_duration'],'dur'],['Замерзание',['cold_exposure_duration'],'dur'],['Жара',['hot_exposure_duration'],'dur'],['Ударов ближним',['melee_strikes']]]}
+];
+const dur=v=>v>=3600?fmtN(Math.round(v/3600))+' ч':v>=60?fmtN(Math.round(v/60))+' мин':fmtN(v)+' с';
+function statsHTML(d){
+  const S=d.stats||{}, m=d.m, used=new Set();
+  const hsr=S.headshot!=null&&S.bullet_hit_player?(S.headshot/S.bullet_hit_player*100).toFixed(1)+'%':'—';
+  const st=(l,v,k)=>`<div class="t${k?' k':''}"><span>${l}</span><b class="mono">${v}</b></div>`;
+  const sum=`<div class="sumrow">${st('K/D',m.kd??'—',1)}${st('Убийства',fmtN(m.kills))}${st('Смерти',fmtN(m.deaths))}${st('Хедшоты',fmtN(m.hs))}${st('Точность',m.acc!=null?m.acc+'%':'—')}<div class="t" title="Хедшоты к попаданиям по игрокам, приблизительно"><span>В голову</span><b class="mono">${hsr}</b></div></div>`;
+  const cats=CATS.map(c=>{
+    const rows=c.rows.map(([l,keys,kind])=>{
+      const k=keys.find(x=>S[x]!=null); if(!k)return ''; keys.forEach(x=>used.add(x));
+      return `<div class="r"><span>${l}</span><b>${kind==='dur'?dur(S[k]):fmtN(S[k])}</b></div>`;
+    }).join('');
+    return rows?`<div class="cat" style="--c:${c.c}"><h4><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[c.i]}</svg>${c.t}</h4>${rows}</div>`:'';
+  }).join('');
+  const rest=Object.keys(S).filter(k=>!used.has(k)).sort();
+  const more=rest.length?`<details class="more"><summary>Остальная статистика (${rest.length})</summary>${rest.map(k=>`<div class="r"><code>${esc(k)}</code><b class="mono">${fmtN(S[k])}</b></div>`).join('')}</details>`:'';
+  return sum+`<div class="cats">${cats}</div>`+more;
+}
+
+/* ---------- рекламные баннеры ---------- */
+S.banners={contact:null,slots:[]};
+function adHTML(pos){
+  const b=S.banners, list=b.slots.filter(x=>x.position===pos&&/^https:\/\//.test(x.image)&&/^https:\/\//.test(x.url));
+  if(list.length){
+    const x=list[Math.floor(Math.random()*list.length)];
+    return `<a class="ad" href="${esc(x.url)}" target="_blank" rel="noopener sponsored"><span class="adtag">Реклама</span><img src="${esc(x.image)}" alt="${esc(x.title)}" loading="lazy"></a>`;
+  }
+  if(pos==='profile'&&b.contact)return `<div class="ad empty"><b>Место для баннера вашего сервера</b><p>Игроки Rust видят его на каждом профиле. Баннер 1200×400.</p><a class="btn" href="https://t.me/${esc(b.contact.slice(1))}" target="_blank" rel="noopener">Забронировать</a></div>`;
+  return '';
+}
+async function loadBanners(){
+  try{S.banners=await api('/api/banners')}catch{}
+  if(!S.cur)$('#adHome').innerHTML=adHTML('home');
+}
+
+const tile=(l,v,hi)=>`<div class="t${hi?' hi':''}"><span>${l}</span><b class="mono">${v}</b></div>`;
+
+function renderProfile(){
+  const d=S.cur,p=d.profile,r=d.rust,m=d.m,b=d.bans,t=d.tracked;
+  const inRust=p.gameid===RUST;
+  let status;
+  if(p.gameid) status=`<span class="pill ${inRust?'warn':'on'}">Сейчас в игре: ${esc(p.gameextrainfo||('app '+p.gameid))}</span>`;
+  else status=`<span class="pill ${p.personastate>0?'on':''}">${STATE[p.personastate]||'неизвестно'}</span>`;
+  if(!p.gameid&&p.personastate===0&&p.lastlogoff)status+=`<span class="pill">был в сети: ${date(p.lastlogoff)}</span>`;
+  if(inRust){
+    const si=d.serverInfo;
+    status+=si?`<span class="pill warn">${esc(si.name)} · ${si.players}/${si.max}</span>`
+      :p.gameserverip?`<span class="pill warn">сервер ${esc(p.gameserverip)}</span>`:'<span class="pill">адрес сервера скрыт</span>';
+  }
+  let banPills='';
+  if(b){
+    if(b.VACBanned)banPills+=`<span class="pill bad">VAC-бан: ${b.NumberOfVACBans}</span>`;
+    if(b.NumberOfGameBans)banPills+=`<span class="pill bad">Игровых банов: ${b.NumberOfGameBans}</span>`;
+    if(b.CommunityBanned)banPills+='<span class="pill bad">Бан сообщества</span>';
+    if(b.EconomyBan&&b.EconomyBan!=='none')banPills+=`<span class="pill warn">Торговый бан: ${esc(b.EconomyBan)}</span>`;
+    if(b.VACBanned||b.NumberOfGameBans)banPills+=`<span class="pill">последний бан ${b.DaysSinceLastBan} дн. назад</span>`;
+    if(!banPills)banPills='<span class="pill on">Банов нет</span>';
+  }
+  const timeTiles=r.owned?`<div class="tiles">${tile('Часов в Rust',hrs(r.minutesTotal),1)}${tile('За 2 недели',hrs(r.minutes2w))}${tile('Последний запуск',r.lastPlayed?date(r.lastPlayed):'—')}${tile('Достижений',fmtN(m.ach))}</div>`:'';
+  const topNote=!d.isPublic?'<p class="note">Профиль закрыт, Steam не отдаёт часы и статистику.</p>':!r.owned?'<p class="note">Часы в Rust скрыты в настройках приватности Steam или игры нет у аккаунта.</p>':'';
+  const rustBlock=topNote+timeTiles+(r.statsVisible?statsHTML(d):'<p class="note">Статистика игры скрыта в настройках приватности Steam.</p>');
+  const recent=d.recent.length?`<div class="recent">${d.recent.map(g=>`<span>${esc(g.name)} · ${hrs(g.playtime_2weeks)}</span>`).join('')}</div>`:'<p class="note">Нет данных о недавних играх.</p>';
+  const names=[...d.names].reverse();
+  const namesBlock=names.length>1
+    ?`<ul class="names">${names.map(n=>`<li>${esc(n.name)} <span>с ${dt(n.t)}</span></li>`).join('')}</ul>`
+    :'<p class="note">Пока один ник. Новые имена появятся здесь, когда игрок сменит ник, а вы или слежка это заметите.</p>';
+
+  const tgOk=S.cfg.telegram&&S.cfg.telegram.linked;
+  const track=d.optout?`<div class="sec"><h3>Слежка</h3><p class="note" style="margin-top:0">Этот игрок отказался от слежки. Вы видите только его открытый профиль Steam прямо сейчас, история не ведётся.</p></div>`:t?`<div class="sec"><h3>Слежка</h3>
+      <div class="chips" id="chips"></div>
+      <div class="row"><input type="text" id="tagIn" placeholder="Новый тег, Enter" maxlength="24" list="tagSug"></div>
+      <div class="row"><input type="text" id="grpIn" value="${esc(t.group)}" placeholder="Группа или клан" maxlength="30" list="grpList"></div>
+      <textarea id="noteIn" rows="3" maxlength="1000" placeholder="Заметка">${esc(t.note)}</textarea>
+      <label class="chk"><input type="checkbox" id="alertIn" ${t.alertRust?'checked':''}> Сообщать в Telegram, когда зайдёт в Rust${tgOk?'':' (сначала подключите Telegram в «Настройках»)'}</label>
+      <div id="hist"><p class="note">Загружаем историю…</p></div></div>`
+    :`<div class="sec"><h3>Слежка</h3><p class="note" style="margin-top:0">Добавьте игрока в слежку: сервер начнёт записывать его онлайн, сервера, баны и смену ников, а ещё откроются теги и заметки.</p></div>`;
+
+  $('#out').innerHTML=`<article class="card">
+    <div class="head">
+      <img src="${esc(p.avatarfull)}" alt="">
+      <div>
+        <h2>${esc(p.personaname)}</h2>
+        <p class="meta mono">${esc(p.steamid)}</p>
+        <div>${status}${banPills}</div>
+        <p class="meta">Аккаунт создан: ${date(p.timecreated)}${d.level!=null?' · уровень Steam '+d.level:''}${d.friends!=null?' · друзей '+d.friends:''}</p>
+        ${p.loccountrycode?`<p class="meta">Страна в профиле: ${esc(p.loccountrycode)}</p>`:''}
+      </div>
+      ${inRust?'<div class="stamp">Играет в Rust</div>':''}
+    </div>
+    <div class="sec"><h3>Rust</h3>${rustBlock}</div>
+    <div class="sec"><h3>Недавно играл</h3>${recent}</div>
+    <div class="sec"><h3>История ников</h3>${namesBlock}</div>
+    ${track}
+    <div class="sec"><div class="actions" style="margin-top:0">
+      ${d.optout?'':`<button class="btn" id="wbtn">${t?'Убрать из слежки':'Следить за игроком'}</button>`}
+      <button class="btn ghost" id="cardBtn">Карточка для Telegram</button>
+      <button class="btn ghost" id="cmpBtn">Сравнить с…</button>
+      <button class="btn ghost" id="cbtn">Скопировать SteamID</button>
+      <a class="btn ghost" href="${esc(safeUrl(p.profileurl))}" target="_blank" rel="noopener">Открыть в Steam</a>
+    </div></div>
+  </article>`;
+
+  $('#adHome').innerHTML='';
+  $('#out').insertAdjacentHTML('beforeend',adHTML('profile'));
+  if($('#wbtn'))$('#wbtn').onclick=async e=>{
+    e.target.disabled=true;
+    try{await api(t?'/api/untrack':'/api/track',{id:p.steamid});await reload()}catch(x){alert(x.message);e.target.disabled=false}
+  };
+  $('#cbtn').onclick=e=>{navigator.clipboard?.writeText(p.steamid);e.target.textContent='Скопировано'};
+  $('#cmpBtn').onclick=()=>{$('#cmpA').value=p.steamid;$('#cmpB').value='';tab('compare');$('#cmpB').focus()};
+  $('#cardBtn').onclick=openCard;
+  if(t){wireTrack();renderChips();loadHist(p.steamid)}
+}
+
+/* слежка: теги, заметка, группа, оповещение */
+async function saveMeta(){
+  const t=S.cur.tracked;
+  try{await api('/api/meta',{id:t.id,tags:t.tags,note:t.note,group:t.group,alertRust:t.alertRust});loadTracked()}catch(e){alert(e.message)}
+}
+function renderChips(){
+  $('#chips').innerHTML=S.cur.tracked.tags.map(x=>`<button class="chip" data-tag="${esc(x)}" title="Убрать">${esc(x)} ✕</button>`).join('');
+}
+function wireTrack(){
+  const t=S.cur.tracked;
+  $('#chips').onclick=e=>{const c=e.target.closest('.chip');if(!c)return;t.tags=t.tags.filter(x=>x!==c.dataset.tag);renderChips();saveMeta()};
+  $('#tagIn').onkeydown=e=>{
+    if(e.key!=='Enter')return; e.preventDefault();
+    const v=e.target.value.trim(); if(v&&!t.tags.includes(v)&&t.tags.length<10){t.tags.push(v);renderChips();saveMeta()}
+    e.target.value='';
+  };
+  $('#grpIn').onchange=e=>{t.group=e.target.value.trim();saveMeta()};
+  $('#noteIn').onchange=e=>{t.note=e.target.value;saveMeta()};
+  $('#alertIn').onchange=e=>{t.alertRust=e.target.checked;saveMeta()};
+}
+
+/* график онлайна и журнал */
+async function loadHist(id){
+  try{S.hist=await api('/api/history?id='+id);renderHist()}
+  catch(e){const h=$('#hist');if(h)h.innerHTML='<p class="err">'+esc(e.message)+'</p>'}
+}
+const EV={online:'зашёл в Steam',offline:'вышел из сети',rust_start:'запустил Rust',rust_stop:'вышел из Rust',server:'сменил сервер',ban:'получил новый бан'};
+function renderHist(){
+  const h=S.hist, el=$('#hist'); if(!h||!el)return;
+  const k=S.heat==='rust'?2:1, color=S.heat==='rust'?'var(--rust)':'var(--moss)';
+  let total=0, cells='<span></span>'+Array.from({length:24},(_,i)=>`<u>${i%6===0?i:''}</u>`).join('');
+  for(let d=0;d<7;d++){
+    cells+=`<span>${DAYS[d]}</span>`;
+    for(let hr=0;hr<24;hr++){
+      const c=h.heat[d*24+hr]; total+=c[0];
+      const ratio=c[0]?c[k]/c[0]:0;
+      cells+=`<i style="--c:${color};--a:${(c[0]?0.08+0.92*ratio:0).toFixed(2)}" title="${DAYS[d]} ${hr}:00. ${Math.round(ratio*100)}% (замеров: ${c[0]})"></i>`;
+    }
+  }
+  const log=[...h.events].reverse().slice(0,20).map(e=>{
+    const extra=e.type==='ban'?` (VAC ${e.vac}, игровых ${e.game})`:e.server?' · '+esc(e.server):'';
+    return `<li><time>${dt(e.t)}</time>${EV[e.type]||esc(e.type)}${extra}</li>`;
+  }).join('');
+  el.innerHTML=`<h3 style="margin-top:22px">Когда играет</h3>
+    <div class="seg"><button data-m="online" class="${S.heat==='online'?'on':''}">В сети</button><button data-m="rust" class="${S.heat==='rust'?'on':''}">В Rust</button></div>
+    <div class="heat">${cells}</div>
+    <p class="note">Часовой пояс: ${esc(h.tz)}. Замеров: ${fmtN(total)}${total<200?'. Данных пока мало, график станет точнее через несколько дней.':'.'}</p>
+    <h3 style="margin-top:22px">Журнал</h3>
+    ${log?`<ul class="log">${log}</ul>`:'<p class="note">Событий пока нет.</p>'}`;
+  el.querySelector('.seg').onclick=e=>{const b=e.target.closest('button');if(b){S.heat=b.dataset.m;renderHist()}};
+}
+
+/* ---------- карточка для Telegram ---------- */
+const loadImg=src=>new Promise(ok=>{const i=new Image();i.onload=()=>ok(i);i.onerror=()=>ok(null);i.src=src});
+function fit(g,txt,x,y,w,size,font){let s=size;do{g.font=font(s);s-=2}while(g.measureText(txt).width>w&&s>22);g.fillText(txt,x,y)}
+async function drawCard(cv,d){
+  const g=cv.getContext('2d'),p=d.profile,m=d.m;
+  try{await document.fonts.load('800 52px "Big Shoulders Stencil"');await document.fonts.load('500 22px "IBM Plex Sans"')}catch{}
+  const ST=s=>`800 ${s}px "Big Shoulders Stencil",Impact,sans-serif`, BD=s=>`500 ${s}px "IBM Plex Sans",system-ui,sans-serif`;
+  g.fillStyle='#1b1d1c';g.fillRect(0,0,1000,520);
+  g.fillStyle='#c25a2b';g.fillRect(0,0,14,520);
+  g.fillStyle='#2f3331';g.fillRect(50,50,180,180);
+  const img=await loadImg('/api/avatar?u='+encodeURIComponent(p.avatarfull)); if(img)g.drawImage(img,50,50,180,180);
+  g.fillStyle='#e3dccb'; fit(g,p.personaname,262,118,470,72,ST);
+  g.fillStyle='#9a9a8e'; g.font=BD(22); g.fillText(p.steamid,262,156);
+  const inRust=p.gameid===RUST;
+  g.fillStyle=inRust?'#d6a72a':'#9a9a8e'; g.font=BD(24);
+  g.fillText(p.gameid?'Сейчас в игре: '+(p.gameextrainfo||p.gameid):(['не в сети','в сети'][p.personastate]||'статус: '+(STATE[p.personastate]||'?')),262,200);
+  if(inRust){
+    g.save();g.translate(790,110);g.rotate(-0.09);g.strokeStyle='#c25a2b';g.lineWidth=5;g.strokeRect(-110,-34,220,68);
+    g.fillStyle='#c25a2b';g.font=ST(34);g.textAlign='center';g.fillText('ИГРАЕТ В RUST',0,12);g.restore();g.textAlign='left';
+  }
+  const items=[['Часов в Rust',m.hours!=null?fmtN(m.hours):'—'],['K/D',m.kd??'—'],['Убийств',fmtN(m.kills)],['Точность',m.acc!=null?m.acc+'%':'—']];
+  items.forEach(([l,v],i)=>{
+    const x=50+i*232;
+    g.fillStyle='#2f3331';g.fillRect(x,280,214,120);
+    g.fillStyle=i<2?'#c25a2b':'#3d423f';g.fillRect(x,280,214,5);
+    g.fillStyle='#9a9a8e';g.font=BD(20);g.fillText(l,x+16,320);
+    g.fillStyle='#e3dccb';g.font=ST(52);g.fillText(String(v),x+16,380);
+  });
+  const b=d.bans;
+  g.font=BD(24);
+  if(b&&(b.VACBanned||b.NumberOfGameBans)){g.fillStyle='#c8433a';g.fillText(`Баны: VAC ${b.NumberOfVACBans}, игровых ${b.NumberOfGameBans}`,50,450)}
+  else if(b){g.fillStyle='#7a9a5b';g.fillText('Банов нет',50,450)}
+  g.fillStyle='#767a72';g.font=BD(18);g.fillText('Rust Tracker · '+new Date().toLocaleDateString('ru-RU'),50,495);
+}
+async function openCard(){
+  const d=S.cur, cv=$('#cv'); $('#shareMsg').textContent=''; $('#shareMsg').className='note';
+  $('#dlg').showModal();
+  await drawCard(cv,d);
+  $('#dlPng').href=cv.toDataURL('image/png');
+}
+$('#closeDlg').onclick=()=>$('#dlg').close();
+$('#sendTg').onclick=async e=>{
+  const d=S.cur,m=d.m,msg=$('#shareMsg'); e.target.disabled=true; msg.className='note'; msg.textContent='Отправляем…';
+  try{
+    const blob=await new Promise(ok=>$('#cv').toBlob(ok,'image/png'));
+    const cap=`${d.profile.personaname}\n${m.hours!=null?m.hours+' ч в Rust':''}${m.kd!=null?' · K/D '+m.kd:''}\n${d.profile.profileurl||''}`;
+    const r=await fetch('/api/share?cap='+encodeURIComponent(cap),{method:'POST',headers:{'x-rt':'1','content-type':'image/png'},body:blob});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||'Не удалось отправить');
+    msg.className='note ok'; msg.textContent='Отправлено в Telegram.';
+  }catch(x){msg.className='note err';msg.textContent=x.message}
+  e.target.disabled=false;
+};
+
+/* ---------- сравнение ---------- */
+$('#cf').addEventListener('submit',async e=>{
+  e.preventDefault(); const out=$('#cmpOut'); out.innerHTML='<p class="load">Сравниваем…</p>';
+  try{
+    const [a,b]=await Promise.all([api('/api/player?q='+encodeURIComponent($('#cmpA').value)),api('/api/player?q='+encodeURIComponent($('#cmpB').value))]);
+    const rows=[['Часов в Rust','hours',1],['За 2 недели, ч','hours2w',1],['Убийств игроков','kills',1],['Смертей','deaths',-1],['K/D','kd',1],['Хедшотов','hs',1],['Точность, %','acc',1],['Выстрелов','fired',1],['Достижений','ach',1],['Уровень Steam','level',1]];
+    const cell=(v,o,dir)=>`<td class="n ${v!=null&&o!=null&&v!==o&&((v-o)*dir>0)?'win':''}">${v==null?'—':fmtN(v)}</td>`;
+    const banTxt=x=>x.bans?(x.bans.VACBanned||x.bans.NumberOfGameBans?`VAC ${x.bans.NumberOfVACBans}, игровых ${x.bans.NumberOfGameBans}`:'нет'):'—';
+    const head=x=>`<th><div class="cmphead"><img src="${esc(x.profile.avatarfull)}" alt="">${esc(x.profile.personaname)}</div></th>`;
+    out.innerHTML=`<table class="tbl"><thead><tr><th></th>${head(a)}${head(b)}</tr></thead><tbody>
+      ${rows.map(([l,k,dir])=>`<tr><th>${l}</th>${cell(a.m[k],b.m[k],dir)}${cell(b.m[k],a.m[k],dir)}</tr>`).join('')}
+      <tr><th>Баны</th><td>${banTxt(a)}</td><td>${banTxt(b)}</td></tr></tbody></table>
+      <p class="note">Если у игрока скрыта статистика, в его столбце будет прочерк.</p>`;
+  }catch(x){out.innerHTML='<p class="err">'+esc(x.message)+'</p>'}
+});
+
+/* ---------- рейтинг ---------- */
+async function loadRating(){
+  $('#ratOut').innerHTML='<p class="load">Загружаем данные игроков…</p>';
+  try{S.rows=await api('/api/rating?group='+encodeURIComponent($('#ratGroup').value));renderRating()}
+  catch(e){$('#ratOut').innerHTML='<p class="err">'+esc(e.message)+'</p>'}
+}
+function renderRating(){
+  if(!S.rows.length){$('#ratOut').innerHTML='<p class="note">Список слежки пуст.</p>';return}
+  const k=$('#ratSort').value;
+  const rows=[...S.rows].sort((a,b)=>(b.m[k]??-1)-(a.m[k]??-1));
+  $('#ratOut').innerHTML=`<table class="tbl"><thead><tr><th>#</th><th>Игрок</th><th>Группа</th><th>Часы</th><th>K/D</th><th>Убийства</th><th>Хедшоты</th><th>Точность</th></tr></thead><tbody>
+    ${rows.map((r,i)=>`<tr><td class="n">${i+1}</td><td><div class="who"><img src="${esc(r.avatar)}" alt=""><a href="#${esc(r.id)}" data-id="${esc(r.id)}">${esc(r.name)}</a></div></td><td>${esc(r.group)||'—'}</td>
+    <td class="n">${fmtN(r.m.hours)}</td><td class="n">${r.m.kd??'—'}</td><td class="n">${fmtN(r.m.kills)}</td><td class="n">${fmtN(r.m.hs)}</td><td class="n">${r.m.acc!=null?r.m.acc+'%':'—'}</td></tr>`).join('')}</tbody></table>`;
+}
+$('#ratSort').onchange=renderRating;
+$('#ratGroup').onchange=loadRating;
+$('#ratOut').addEventListener('click',e=>{const a=e.target.closest('a[data-id]');if(a){e.preventDefault();lookup(a.dataset.id)}});
+
+/* ---------- серверы ---------- */
+async function loadServers(){
+  const el=$('#srvOut'); el.innerHTML='<p class="load">Смотрим, кто где играет…</p>';
+  try{
+    const rows=await api('/api/servers');
+    if(!rows.length){el.innerHTML='<p class="note">Сейчас никто из слежки не в Rust. Адрес сервера Steam отдаёт только тем, у кого открыт статус игры.</p>';return}
+    el.innerHTML=rows.map(s=>`<div class="srv"><h3>${esc(s.info?.name||s.addr||'Сервер скрыт')}</h3>
+      <p class="meta">${s.addr?esc(s.addr):''}${s.info?` · онлайн ${s.info.players}/${s.info.max}`:''}</p>
+      <div class="recent" style="margin-top:8px">${s.players.map(p=>`<span><a href="#${esc(p.id)}" data-id="${esc(p.id)}">${esc(p.name)}</a>${p.group?' · '+esc(p.group):''}</span>`).join('')}</div></div>`).join('');
+  }catch(e){el.innerHTML='<p class="err">'+esc(e.message)+'</p>'}
+}
+$('#srvOut').addEventListener('click',e=>{const a=e.target.closest('a[data-id]');if(a){e.preventDefault();lookup(a.dataset.id)}});
+
+/* ---------- настройки: Telegram и приватность ---------- */
+function showLogin(){$('#login').hidden=false;$('#app').hidden=true}
+function renderMe(){
+  const c=S.cfg,el=$('#me'); if(c.mode!=='multi'||!c.user){el.hidden=true;return}
+  el.hidden=false;
+  el.innerHTML=`${c.user.avatar?`<img src="${esc(c.user.avatar)}" alt="">`:''}<div><b>${esc(c.user.name)}</b><button class="x" id="logout">Выйти</button></div>`;
+  $('#logout').onclick=async()=>{await api('/auth/logout',{}).catch(()=>{});location.reload()};
+}
+async function refreshMe(){try{S.cfg=await api('/api/me')}catch{}}
+function renderSettings(){
+  const c=S.cfg,t=c.telegram||{},multi=c.mode==='multi';
+  let tg;
+  if(!t.configured) tg='<p class="note">На сервере не задан TG_BOT_TOKEN, поэтому оповещения выключены.</p>';
+  else if(t.linked) tg=`<p>Статус: <b class="ok">подключён</b></p><div class="actions"><button class="btn" id="tgTest">Отправить тест</button>${multi?'<button class="btn ghost" id="tgUnlink">Отключить</button>':''}</div><p class="note" id="tgMsg"></p>`;
+  else if(multi) tg='<p>Статус: <b class="err">не подключён</b></p><div class="actions"><button class="btn" id="tgLink">Подключить Telegram</button></div><p class="note" id="tgMsg">Откроется чат с ботом, нажмите в нём «Запустить».</p>';
+  else tg='<p>Статус: <b class="err">не подключён</b></p><p class="note">Впишите TG_BOT_TOKEN и TG_CHAT_ID в .env и перезапустите сервер.</p>';
+  const priv=multi&&c.user?`<h3 style="margin-top:30px">Приватность</h3>
+    <label class="chk"><input type="checkbox" id="optIn" ${c.user.optout?'checked':''}> Не отслеживать мой аккаунт: другие не смогут добавить меня в слежку, накопленная история будет удалена</label>
+    <div class="actions"><button class="btn ghost" id="delMe">Удалить мои данные с сайта</button><a class="btn ghost" href="/privacy" target="_blank">Политика конфиденциальности</a></div>`:'';
+  $('#setOut').innerHTML=`<p class="sub">Через Telegram приходят новые баны игроков из слежки, вход в Rust (включается у каждого игрока) и карточки профилей.</p>${tg}
+    <p class="note">Опрос слежки: раз в ${c.pollSec} с. Проверка банов: раз в ${c.banMin} мин. В слежке до ${c.maxWatch} игроков. Часовой пояс графика: ${esc(c.tz)}.</p>${priv}`;
+  const msg=(txt,cls)=>{const m=$('#tgMsg');if(m){m.className='note '+(cls||'');m.innerHTML=txt}};
+  const test=$('#tgTest'); if(test)test.onclick=async()=>{msg('Отправляем…');try{await api('/api/test-telegram',{});msg('Сообщение отправлено.','ok')}catch(e){msg(esc(e.message),'err')}};
+  const un=$('#tgUnlink'); if(un)un.onclick=async()=>{await api('/api/tg/unlink',{});await refreshMe();renderSettings()};
+  const ln=$('#tgLink'); if(ln)ln.onclick=async()=>{
+    try{
+      const r=await api('/api/tg/link',{});
+      msg(`Откройте <a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a> и нажмите «Запустить». Эта страница обновится сама.`);
+      window.open(r.url,'_blank');
+      for(let i=0;i<60;i++){await new Promise(ok=>setTimeout(ok,3000));await refreshMe();if(S.cfg.telegram.linked){renderSettings();return}}
+    }catch(e){msg(esc(e.message),'err')}
+  };
+  const oi=$('#optIn'); if(oi)oi.onchange=async()=>{
+    if(oi.checked&&!confirm('Вас уберут из всех списков слежки, история будет удалена. Продолжить?')){oi.checked=false;return}
+    await api('/api/optout',{on:oi.checked});await refreshMe();loadTracked();
+  };
+  const dm=$('#delMe'); if(dm)dm.onclick=async()=>{
+    if(!confirm('Удалить ваш аккаунт на сайте, ваш список слежки и привязку Telegram?'))return;
+    await api('/api/delete-me',{});location.reload();
+  };
+}
+
+/* ---------- запуск ---------- */
+$('#f').addEventListener('submit',e=>{e.preventDefault();lookup($('#q').value)});
+(async()=>{
+  try{S.cfg=await api('/api/me')}catch{S.cfg={mode:'local',telegram:{}}}
+  if(S.cfg.mode==='multi'&&!S.cfg.user){showLogin();return}
+  renderMe(); loadTracked(); loadBanners(); setInterval(loadTracked,30000);
+  if(/^#\d{17}$/.test(location.hash))lookup(location.hash.slice(1));
+})();
+</script>
+</body>
+</html>

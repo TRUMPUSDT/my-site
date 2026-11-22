@@ -248,6 +248,7 @@ def player(sid):
             'wood': st.get('harvest.wood'), 'stone': st.get('harvest.stones'),
             'ach': ach, 'level': lvl,
         },
+        'stats': st,
         'recent': dig(r['recent'], 'response', 'games') or [],
         'level': lvl,
         'friends': len(dig(r['friends'], 'friendslist', 'friends')) if dig(r['friends'], 'friendslist', 'friends') is not None else None,
@@ -590,6 +591,33 @@ def login_user(sid):
     return tok
 
 
+# ---------------- рекламные баннеры (public/banners.json) ----------------
+def load_banners():
+    """Читает banners.json при каждом запросе: правите файл, и всё сразу обновляется."""
+    try:
+        with open(os.path.join(HERE, 'public', 'banners.json'), encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {'contact': None, 'slots': []}
+    today = time.strftime('%Y-%m-%d')
+    c = data.get('contact')
+    contact = c if isinstance(c, str) and re.fullmatch(r'@[A-Za-z0-9_]{5,32}', c) else None
+    slots = []
+    for x in data.get('slots') or []:
+        if not isinstance(x, dict):
+            continue
+        img, url = str(x.get('image', '')), str(x.get('url', ''))
+        if not (img.startswith('https://') and url.startswith('https://')):
+            continue                                  # только https, иначе пропускаем
+        if x.get('from') and str(x['from']) > today:
+            continue
+        if x.get('until') and str(x['until']) < today:
+            continue
+        slots.append({'position': x.get('position') if x.get('position') in ('home', 'profile') else 'profile',
+                      'image': img[:500], 'url': url[:500], 'title': clean(x.get('title'), 80)})
+    return {'contact': contact, 'slots': slots[:20]}
+
+
 # ---------------- лимиты ----------------
 rl, daily = {}, {}
 
@@ -736,6 +764,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, me)
         if P.startswith('/api/') and not user:
             return self.send(401, {'error': 'Войдите через Steam', 'login': True})
+
+        if P == '/api/banners':
+            return self.send(200, load_banners())
 
         # --- профили ---
         if P == '/api/player':
