@@ -138,6 +138,10 @@ details.more code{color:var(--dim);font-size:13px}
 .ad.empty b{display:block;color:var(--bone);margin-bottom:4px}
 .ad.empty p{margin:0 0 14px;font-size:13px}
 .ad.empty .btn{display:inline-flex;align-items:center;text-decoration:none}
+/* вайпы */
+.hero{background:var(--plate);border:1px solid var(--line);border-top:3px solid var(--rust);padding:20px 22px;margin-bottom:22px;max-width:760px}
+.hero b{display:block;font:800 clamp(30px,6vw,52px)/1.05 var(--stencil);margin:4px 0}
+.hero span,.hero small{color:var(--dim)}
 @media (max-width:820px){
   .app{grid-template-columns:1fr}
   aside{position:static;max-height:none;border-right:0;border-bottom:1px solid var(--line)}
@@ -169,6 +173,7 @@ details.more code{color:var(--dim);font-size:13px}
       <button class="tab" data-tab="compare">Сравнение</button>
       <button class="tab" data-tab="rating">Рейтинг</button>
       <button class="tab" data-tab="servers">Серверы</button>
+      <button class="tab" data-tab="wipes">Вайпы</button>
       <button class="tab" data-tab="settings">Настройки</button>
     </nav>
 
@@ -214,6 +219,16 @@ details.more code{color:var(--dim);font-size:13px}
       <h1>Серверы</h1>
       <p class="sub">На каких серверах Rust сейчас сидят игроки из слежки.</p>
       <div id="srvOut"></div>
+    </section>
+
+    <section class="pane" id="p-wipes" hidden>
+      <h1>Вайпы</h1>
+      <div id="wipeHero"></div>
+      <h3 style="margin:0 0 6px">Мои серверы</h3>
+      <p class="sub" style="margin-bottom:14px">Добавьте сервер: сайт покажет, когда он вайпался в последний раз, и пришлёт сообщение в Telegram, как только вайп произойдёт.</p>
+      <form id="wf"><input type="text" id="wq" placeholder="Ссылка BattleMetrics или IP:порт (например 1.2.3.4:28015)" required><button class="btn" type="submit">Найти</button></form>
+      <div id="wPrev"></div>
+      <div id="msList"></div>
     </section>
 
     <section class="pane" id="p-settings" hidden>
@@ -264,6 +279,7 @@ function tab(name){
   $$('.pane').forEach(p=>p.hidden=p.id!=='p-'+name);
   if(name==='rating')loadRating();
   if(name==='servers')loadServers();
+  if(name==='wipes')loadWipes();
   if(name==='settings')renderSettings();
 }
 $('nav').addEventListener('click',e=>{const b=e.target.closest('.tab');if(b)tab(b.dataset.tab)});
@@ -634,6 +650,58 @@ function renderSettings(){
     await api('/api/delete-me',{});location.reload();
   };
 }
+
+/* ---------- вайпы ---------- */
+const ago=ts=>{if(!ts)return 'нет данных';const s=Math.max(0,Math.floor(Date.now()/1000)-ts),d=Math.floor(s/86400);return d>0?d+' дн. назад':s>=3600?Math.floor(s/3600)+' ч назад':'только что'};
+const cdText=(left,full)=>{if(left<=0)return 'идёт вайп';const d=Math.floor(left/86400),h=Math.floor(left%86400/3600),m=Math.floor(left%3600/60),sec=left%60;return full?`${d} дн ${h} ч ${m} мин ${sec} с`:(d?`${d} дн ${h} ч`:`${h} ч ${m} мин`)};
+const dtFull=ts=>new Date(ts*1000).toLocaleString('ru-RU',{weekday:'short',day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'});
+function tick(){const t=Math.floor(Date.now()/1000);$$('[data-cd]').forEach(el=>{el.textContent=cdText(el.dataset.cd-t,el.dataset.full==='1')})}
+setInterval(tick,1000);
+function wipeCard(s,btns){
+  return `<div class="srv wp" data-id="${esc(s.id)}">
+   <h3>${esc(s.name)}${s.modded?' <span class="pill">modded</span>':''}${s.status&&s.status!=='online'?' <span class="pill bad">офлайн</span>':''}</h3>
+   <p class="meta">${esc(s.addr)} · онлайн ${s.players??'—'}/${s.max??'—'}${s.country?' · '+esc(s.country):''}</p>
+   <div class="tiles" style="margin-top:10px">
+     <div class="t hi"><span>Последний вайп</span><b>${esc(ago(s.last_wipe))}</b></div>
+     <div class="t"><span>Ближайший общий вайп</span><b data-cd="${s.next_wipe}">…</b></div>
+     ${s.guess?`<div class="t"><span>Свой вайп, примерно</span><b data-cd="${s.guess}">…</b></div>`:''}
+   </div>
+   <p class="note">${s.last_wipe?'Последний вайп: '+esc(dtFull(s.last_wipe))+'. ':'BattleMetrics не отдал время последнего вайпа. '}${s.guess?'Свой вайп посчитан по прошлым вайпам сервера и может ошибаться.':''}</p>
+   <div class="actions">${btns||''}</div></div>`;
+}
+async function loadWipes(){
+  try{S.wipe=await api('/api/wipe')}catch(e){$('#wipeHero').innerHTML='<p class="err">'+esc(e.message)+'</p>';return}
+  const utc=new Date(S.wipe.force*1000).toISOString().slice(11,16);
+  $('#wipeHero').innerHTML=`<div class="hero"><span>Ближайший общий вайп Rust</span><b data-cd="${S.wipe.force}" data-full="1">…</b><small>${esc(dtFull(S.wipe.force))} по вашему времени (${utc} UTC). Время примерное: обновление иногда выходит позже.</small></div>`;
+  tick(); loadMine();
+}
+async function loadMine(){
+  const el=$('#msList');
+  try{S.mine=await api('/api/srv/mine')}catch(e){el.innerHTML='<p class="err">'+esc(e.message)+'</p>';return}
+  const tgNote=S.cfg.telegram&&S.cfg.telegram.linked?'':'<p class="note">Чтобы получать сообщения о вайпе, подключите Telegram в «Настройках».</p>';
+  el.innerHTML=tgNote+(S.mine.length?S.mine.map(s=>wipeCard(s,`<label class="chk" style="margin:0"><input type="checkbox" data-act="alert" ${s.alert?'checked':''}> Сообщать в Telegram о вайпе</label><button class="btn ghost" data-act="unfollow">Убрать</button>`)).join(''):'<p class="note">Список пуст. Найдите сервер выше.</p>');
+  tick();
+}
+$('#wf').addEventListener('submit',async e=>{
+  e.preventDefault(); const el=$('#wPrev'); el.innerHTML='<p class="load">Ищем сервер…</p>';
+  try{
+    const s=await api('/api/srv/search?q='+encodeURIComponent($('#wq').value));
+    el.innerHTML=wipeCard(s,s.following?'<span class="note">Уже в вашем списке</span>':'<button class="btn" data-act="follow">Добавить в мои серверы</button>'); tick();
+  }catch(x){el.innerHTML='<p class="err">'+esc(x.message)+'</p>'}
+});
+$('#p-wipes').addEventListener('click',async e=>{
+  const b=e.target.closest('[data-act]'); if(!b||b.type==='checkbox')return;
+  const id=b.closest('.wp').dataset.id; b.disabled=true;
+  try{
+    await api(b.dataset.act==='follow'?'/api/srv/follow':'/api/srv/unfollow',{id});
+    if(b.dataset.act==='follow'){$('#wPrev').innerHTML='';$('#wq').value=''}
+    loadMine();
+  }catch(x){alert(x.message);b.disabled=false}
+});
+$('#p-wipes').addEventListener('change',async e=>{
+  const c=e.target.closest('[data-act="alert"]'); if(!c)return;
+  try{await api('/api/srv/alert',{id:c.closest('.wp').dataset.id,on:c.checked})}catch(x){alert(x.message);c.checked=!c.checked}
+});
 
 /* ---------- запуск ---------- */
 $('#f').addEventListener('submit',e=>{e.preventDefault();lookup($('#q').value)});
