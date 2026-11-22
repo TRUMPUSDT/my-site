@@ -6,7 +6,7 @@
 import atexit, base64, hmac, json, os, re, secrets, sys, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 try:
@@ -52,6 +52,11 @@ POLL_SEC = num('POLL_SEC', 60, 20)
 BAN_MIN = num('BAN_CHECK_MIN', 30, 5)
 MAX_WATCH = num('MAX_WATCH', 30, 1) if MULTI else 300
 LOOKUPS_PER_DAY = num('LOOKUPS_PER_DAY', 300, 10)
+BM_TOKEN = E.get('BM_TOKEN', '')                      # необязательно: ключ BattleMetrics, повышает лимиты
+SERVER_POLL_MIN = num('SERVER_POLL_MIN', 10, 5)       # как часто обновлять серверы из BattleMetrics
+MAX_MY_SERVERS = num('MAX_MY_SERVERS', 20, 1) if MULTI else 100
+MAX_SERVERS = num('MAX_SERVERS', 200, 10)             # всего серверов на сайте
+ADMINS = {x for x in re.split(r'[\s,]+', E.get('ADMIN_STEAMIDS', '')) if x}
 TZ = E.get('TZ_NAME') or 'Europe/Warsaw'
 RUST = '252490'
 BASE = 76561197960265728
@@ -81,7 +86,8 @@ def rnd(x):  # округление как в JS, а не «банковское
 # watch:   watch[кто_следит][за_кем] = теги, заметка, группа, флаг оповещения
 # users, sessions, optout: вход, сессии и отказавшиеся от слежки
 DB_FILE = os.path.join(HERE, 'data', 'db.json')
-db = {'players': {}, 'names': {}, 'watch': {}, 'users': {}, 'sessions': {}, 'optout': []}
+db = {'players': {}, 'names': {}, 'watch': {}, 'users': {}, 'sessions': {}, 'optout': [],
+      'servers': {}, 'myservers': {}, 'claims': {}}
 lock = threading.RLock()
 dirty = False
 try:
@@ -92,6 +98,8 @@ except (OSError, ValueError):
 
 
 def migrate():  # старый формат (теги внутри игрока) -> новый
+    for k in ('servers', 'myservers', 'claims'):
+        db.setdefault(k, {})
     for tid, rec in db['players'].items():
         if 'tags' in rec:
             db['watch'].setdefault('local', {})[tid] = {
@@ -591,6 +599,205 @@ def login_user(sid):
     return tok
 
 
+# ---------------- вайпы: общий и по серверам ----------------
+def first_thursday_ts(y, m):
+    """Принудительный вайп Rust: первый четверг месяца, 14:00 по востоку США (19:00 UTC зимой, 18:00 летом)."""
+    d = 1
+    while datetime(y, m, d).weekday() != 3:
+        d += 1
+    sun = 1
+    while datetime(y, m, sun).weekday() != 6:
+        sun += 1
+    dst = 4 <= m <= 10 or (m == 11 and d < sun)   # в США летнее время до первого воскресенья ноября
+    return int(datetime(y, m, d, 18 if dst else 19, tzinfo=timezone.utc).timestamp())
+
+
+def force_wipe_ts(after=None):
+    after = now() if after is None else after
+    d = datetime.fromtimestamp(after, timezone.utc)
+    y, m = d.year, d.month
+    for _ in range(3):
+        ts = first_thursday_ts(y, m)
+        if ts > after:
+            return ts
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+
+def clean_schedule(x):
+    x = x if isinstance(x, dict) else {}
+    kind = x.get('kind') if x.get('kind') in ('force', 'weekly', 'biweekly') else 'force'
+    if kind == 'force':
+        return {'kind': 'force'}
+    try:
+        dow = max(0, min(6, int(x.get('dow', 3))))
+    except (TypeError, ValueError):
+        dow = 3
+    t = str(x.get('time', '19:00'))
+    return {'kind': kind, 'dow': dow, 'time': t if re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', t) else '19:00'}
+
+
+def next_wipe(sv, t=None):
+    """Ближайший вайп: расписание владельца или общий вайп, что раньше."""
+    t = now() if t is None else t
+    cand = [force_wipe_ts(t)]
+    sc = sv.get('schedule') or {'kind': 'force'}
+    if sc.get('kind') in ('weekly', 'biweekly'):
+        hh, mm = map(int, sc['time'].split(':'))
+        base = t
+        if sc['kind'] == 'biweekly' and sv.get('last_wipe'):
+            base = max(t, sv['last_wipe'] + 13 * 86400)
+        d0 = datetime.fromtimestamp(base, timezone.utc).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        for i in range(9):
+            c = d0 + timedelta(days=i)
+            if c.weekday() == sc['dow'] and int(c.timestamp()) > base:
+                cand.append(int(c.timestamp()))
+                break
+    return min(cand)
+
+
+# --- BattleMetrics ---
+bm_cache = {}
+
+
+def bm_get(path, params=None):
+    url = 'https://api.battlemetrics.com' + path + ('?' + urllib.parse.urlencode(params) if params else '')
+    h = {'User-Agent': 'rust-tracker'}
+    if BM_TOKEN:
+        h['Authorization'] = 'Bearer ' + BM_TOKEN
+    body, _ = fetch(url, headers=h)
+    return json.loads(body)
+
+
+def parse_iso(v):
+    try:
+        return int(datetime.fromisoformat(re.sub(r'\.\d+', '', str(v)).replace('Z', '+00:00')).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def bm_parse(item):
+    a, d = item.get('attributes') or {}, (item.get('attributes') or {}).get('details') or {}
+    game = dig(item, 'relationships', 'game', 'data', 'id')
+    if game and game != 'rust':
+        return None
+    return {'id': str(item['id']), 'name': clean(a.get('name'), 120), 'addr': '%s:%s' % (a.get('ip'), a.get('port')),
+            'players': a.get('players'), 'max': a.get('maxPlayers'), 'status': a.get('status'),
+            'country': clean(a.get('country'), 3), 'last_wipe': parse_iso(d.get('rust_last_wipe')),
+            'modded': bool(d.get('rust_modded')), 'type': clean(d.get('rust_type'), 20),
+            'size': d.get('rust_world_size'), 'desc': str(d.get('rust_description') or '')}
+
+
+def bm_server(sid, fresh=False):
+    c = bm_cache.get(sid)
+    if c and c[0] > time.time() and not fresh:
+        return c[1]
+    p = bm_parse(bm_get('/servers/' + sid)['data'])
+    if p:
+        bm_cache[sid] = (time.time() + 300, p)
+        if len(bm_cache) > 500:
+            bm_cache.clear()
+    return p
+
+
+def bm_resolve(q):
+    """Ссылка BattleMetrics, числовой ID или IP:порт -> данные сервера Rust."""
+    q = (q or '').strip()
+    m = re.search(r'battlemetrics\.com/servers/[\w-]+/(\d+)', q) or re.fullmatch(r'(\d{3,9})', q)
+    if m:
+        return bm_server(m.group(1))
+    m = re.fullmatch(r'([\w.-]+?)(?::(\d{2,5}))?', q)
+    if not m:
+        return None
+    host, port = m.group(1), int(m.group(2) or 28015)
+    lst = bm_get('/servers', {'filter[game]': 'rust', 'filter[search]': host, 'page[size]': 25}).get('data', [])
+    pick = next((x for x in lst if x['attributes'].get('port') == port), None) or \
+        next((x for x in lst if x['attributes'].get('port') in (port - 1, port + 1)), None)
+    return bm_parse(pick) if pick else None
+
+
+def apply_server(p):
+    """Кладёт свежие данные в реестр. True, если сервер вайпнулся с прошлого раза."""
+    with lock:
+        sv = db['servers'].setdefault(p['id'], {'id': p['id'], 'wipes': [], 'schedule': {'kind': 'force'}, 'owner': None,
+                                                'verified': False, 'listed': False, 'desc': '', 'url': ''})
+        old, new = sv.get('last_wipe'), p.get('last_wipe')
+        wiped = bool(old and new and new > old + 60)
+        if wiped:
+            sv['wipes'] = (sv.get('wipes', []) + [new])[-30:]
+        for k in ('name', 'addr', 'players', 'max', 'status', 'country', 'modded', 'type', 'size'):
+            sv[k] = p.get(k)
+        if new or not old:
+            sv['last_wipe'] = new
+        if new and not sv['wipes']:
+            sv['wipes'] = [new]                    # первый замеченный вайп: точка отсчёта
+        sv['updated'] = now()
+        save()
+        return wiped
+
+
+def drop_orphan_servers():
+    used = set()
+    for m in db['myservers'].values():
+        used.update(m)
+    for k in [k for k, s in db['servers'].items() if not s.get('listed') and k not in used]:
+        del db['servers'][k]
+
+
+def notify_wipes(ids):
+    for i in ids:
+        sv = db['servers'].get(i)
+        if not sv:
+            continue
+        text = '🧹 <b>%s</b> вайпнулся\nПоследний вайп: %s UTC\nhttps://www.battlemetrics.com/servers/rust/%s' % (
+            hesc(sv['name']), datetime.fromtimestamp(sv['last_wipe'], timezone.utc).strftime('%d.%m %H:%M'), i)
+        for sid, m in list(db['myservers'].items()):
+            if i in m and m[i].get('alert', True):
+                chat = chat_of(sid)
+                if chat:
+                    tg(chat, text)
+                    time.sleep(0.05)
+
+
+def poll_servers():
+    try:
+        with lock:
+            ids = [i for i, s in db['servers'].items() if s.get('listed') or any(i in m for m in db['myservers'].values())]
+        wiped = []
+        for i in ids:
+            try:
+                p = bm_parse(bm_get('/servers/' + i)['data'])
+                if p and apply_server(p):
+                    wiped.append(i)
+            except Exception as e:
+                print('server %s: %s' % (i, e), file=sys.stderr)
+            time.sleep(1.2)                               # не превышаем лимиты BattleMetrics
+        notify_wipes(wiped)
+    except Exception as e:
+        print('servers:', e, file=sys.stderr)
+
+
+def guess_wipe(sv):
+    """Свой ритм сервера по замеченным вайпам: нужно минимум 3 вайпа с почти одинаковыми интервалами."""
+    w = sv.get('wipes') or []
+    if len(w) < 3:
+        return None
+    gaps = [b - a for a, b in zip(w, w[1:])][-4:]
+    if max(gaps) - min(gaps) > 1.5 * 86400 or not 3 * 86400 <= sum(gaps) / len(gaps) <= 35 * 86400:
+        return None
+    g = w[-1] + int(sum(gaps) / len(gaps))
+    return g if g > now() else None
+
+
+def srv_view(sv, user=None):
+    nw = next_wipe(sv)
+    me = user['sid'] if user else None
+    return {'id': sv['id'], 'name': sv.get('name'), 'addr': sv.get('addr'), 'players': sv.get('players'), 'max': sv.get('max'),
+            'status': sv.get('status'), 'country': sv.get('country'), 'modded': sv.get('modded'), 'type': sv.get('type'),
+            'last_wipe': sv.get('last_wipe'), 'schedule': sv.get('schedule') or {'kind': 'force'}, 'next_wipe': nw,
+            'next_is_force': nw == force_wipe_ts(), 'guess': guess_wipe(sv), 'desc': sv.get('desc', ''), 'url': sv.get('url', ''),
+            'mine': bool(me and sv.get('owner') == me), 'following': bool(me and sv['id'] in db['myservers'].get(me, {}))}
+
+
 # ---------------- рекламные баннеры (public/banners.json) ----------------
 def load_banners():
     """Читает banners.json при каждом запросе: правите файл, и всё сразу обновляется."""
@@ -613,7 +820,7 @@ def load_banners():
             continue
         if x.get('until') and str(x['until']) < today:
             continue
-        slots.append({'position': x.get('position') if x.get('position') in ('home', 'profile') else 'profile',
+        slots.append({'position': x.get('position') if x.get('position') in ('home', 'profile', 'catalog') else 'profile',
                       'image': img[:500], 'url': url[:500], 'title': clean(x.get('title'), 80)})
     return {'contact': contact, 'slots': slots[:20]}
 
@@ -760,7 +967,7 @@ class Handler(BaseHTTPRequestHandler):
                   'maxWatch': MAX_WATCH, 'telegram': {'configured': bool(TG_TOKEN), 'linked': bool(chat), 'bot': BOT_USERNAME}}
             if user:
                 me['user'] = {'sid': user['sid'], 'name': user['name'], 'avatar': user.get('avatar', ''),
-                              'optout': user['sid'] in db['optout']}
+                              'optout': user['sid'] in db['optout'], 'admin': user['sid'] in ADMINS}
             return self.send(200, me)
         if P.startswith('/api/') and not user:
             return self.send(401, {'error': 'Войдите через Steam', 'login': True})
@@ -910,6 +1117,142 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(404, {'error': 'no avatar'})
             return self.raw(200, data, hd.get('Content-Type') or 'image/jpeg', [('Cache-Control', 'public, max-age=86400')])
 
+        # --- вайпы ---
+        if P == '/api/wipe':
+            return self.send(200, {'force': force_wipe_ts(), 'now': now()})
+
+        if P == '/api/srv/search':
+            if MULTI and not rate_ok(('bm', user['sid']), 10):
+                return self.send(429, {'error': 'Слишком много поисков серверов, подождите минуту.'})
+            try:
+                p = bm_resolve(Q.get('q'))
+            except Exception:
+                return self.send(502, {'error': 'BattleMetrics не ответил. Попробуйте позже.'})
+            if not p:
+                return self.send(404, {'error': 'Сервер Rust не найден. Дайте ссылку BattleMetrics или IP:порт.'})
+            with lock:
+                sv = dict(db['servers'].get(p['id'], {'id': p['id'], 'schedule': {'kind': 'force'}}))
+                sv.update({k: p[k] for k in ('name', 'addr', 'players', 'max', 'status', 'country', 'modded', 'type', 'last_wipe')})
+                return self.send(200, srv_view(sv, user))
+
+        if P == '/api/srv/mine':
+            with lock:
+                out = []
+                for i, m in db['myservers'].get(user['sid'], {}).items():
+                    if i in db['servers']:
+                        v = srv_view(db['servers'][i], user)
+                        v['alert'] = m.get('alert', True)
+                        out.append(v)
+            return self.send(200, out)
+
+        if P == '/api/srv/follow' and method == 'POST':
+            i = str(self.jbody().get('id', ''))
+            if not re.fullmatch(r'\d{3,9}', i):
+                return self.send(400, {'error': 'Некорректный сервер'})
+            with lock:
+                mine = db['myservers'].setdefault(user['sid'], {})
+                if i in mine:
+                    return self.send(200, {'ok': True})
+                if len(mine) >= MAX_MY_SERVERS:
+                    return self.send(400, {'error': 'Лимит: %d серверов в вашем списке.' % MAX_MY_SERVERS})
+                known = i in db['servers']
+                if not known and len(db['servers']) >= MAX_SERVERS:
+                    return self.send(400, {'error': 'Достигнут общий лимит серверов на сайте.'})
+            if not known:
+                p = bm_server(i)
+                if not p:
+                    return self.send(404, {'error': 'Сервер Rust не найден'})
+                apply_server(p)
+            with lock:
+                db['myservers'].setdefault(user['sid'], {})[i] = {'added': now(), 'alert': True}
+                save()
+            return self.send(200, {'ok': True})
+
+        if P == '/api/srv/unfollow' and method == 'POST':
+            i = str(self.jbody().get('id', ''))
+            with lock:
+                db['myservers'].get(user['sid'], {}).pop(i, None)
+                drop_orphan_servers()
+                save()
+            return self.send(200, {'ok': True})
+
+        if P == '/api/srv/alert' and method == 'POST':
+            b = self.jbody()
+            with lock:
+                m = db['myservers'].get(user['sid'], {}).get(str(b.get('id')))
+                if m is None:
+                    return self.send(404, {'error': 'Сервера нет в вашем списке'})
+                m['alert'] = bool(b.get('on'))
+                save()
+            return self.send(200, {'ok': True})
+
+        if P == '/api/srv/catalog':
+            with lock:
+                rows = [srv_view(s, user) for s in db['servers'].values() if s.get('listed') and s.get('verified')]
+            rows.sort(key=lambda r: -(r['players'] or 0))
+            return self.send(200, rows)
+
+        if P == '/api/srv/owned':
+            with lock:
+                return self.send(200, [srv_view(s, user) | {'listed': s.get('listed')} for s in db['servers'].values() if s.get('owner') == user['sid']])
+
+        if P == '/api/srv/claim' and method == 'POST':
+            i = str(self.jbody().get('id', ''))
+            if not re.fullmatch(r'\d{3,9}', i):
+                return self.send(400, {'error': 'Некорректный сервер'})
+            with lock:
+                code = 'rtv-' + secrets.token_hex(4)
+                db['claims'].setdefault(user['sid'], {})[i] = {'code': code, 'ts': now()}
+                for k in [k for k, c in db['claims'][user['sid']].items() if c['ts'] < now() - 7 * 86400]:
+                    del db['claims'][user['sid']][k]
+                save()
+            return self.send(200, {'code': code})
+
+        if P == '/api/srv/verify' and method == 'POST':
+            if MULTI and not rate_ok(('vf', user['sid']), 6):
+                return self.send(429, {'error': 'Подождите минуту перед следующей проверкой.'})
+            i = str(self.jbody().get('id', ''))
+            with lock:
+                cl = db['claims'].get(user['sid'], {}).get(i)
+            if not cl or cl['ts'] < now() - 7 * 86400:
+                return self.send(400, {'error': 'Сначала нажмите «Я владелец» и получите код.'})
+            try:
+                p = bm_server(i, fresh=True)
+            except Exception:
+                return self.send(502, {'error': 'BattleMetrics не ответил. Попробуйте позже.'})
+            if not p:
+                return self.send(404, {'error': 'Сервер Rust не найден'})
+            if cl['code'] not in p['desc']:
+                return self.send(400, {'error': 'Кода пока нет в описании сервера. BattleMetrics обновляет данные с задержкой в несколько минут. Проверьте описание и попробуйте позже.'})
+            with lock:
+                if i not in db['servers'] and len(db['servers']) >= MAX_SERVERS:
+                    return self.send(400, {'error': 'Достигнут общий лимит серверов на сайте.'})
+            apply_server(p)
+            with lock:
+                sv = db['servers'][i]
+                sv.update(owner=user['sid'], verified=True, listed=True)
+                db['claims'][user['sid']].pop(i, None)
+                save()
+                return self.send(200, srv_view(sv, user))
+
+        if P in ('/api/srv/update', '/api/srv/delist') and method == 'POST':
+            b = self.jbody()
+            with lock:
+                sv = db['servers'].get(str(b.get('id')))
+                if not sv or not (sv.get('owner') == user['sid'] or user['sid'] in ADMINS):
+                    return self.send(403, {'error': 'Это не ваш сервер'})
+                if P == '/api/srv/delist':
+                    sv.update(listed=False, verified=False, owner=None)
+                    drop_orphan_servers()
+                else:
+                    sv['schedule'] = clean_schedule(b.get('schedule'))
+                    sv['desc'] = clean(b.get('desc'), 200)
+                    u = str(b.get('url') or '').strip()
+                    sv['url'] = u[:200] if u.startswith('https://') else ''
+                    sv['listed'] = bool(b.get('listed', True))
+                save()
+                return self.send(200, {'ok': True})
+
         # --- Telegram ---
         if P == '/api/tg/link' and method == 'POST':
             if not MULTI:
@@ -970,6 +1313,12 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 db['users'].pop(me, None)
                 db['watch'].pop(me, None)
+                db['myservers'].pop(me, None)
+                db['claims'].pop(me, None)
+                for sv in db['servers'].values():
+                    if sv.get('owner') == me:
+                        sv.update(owner=None, verified=False, listed=False)
+                drop_orphan_servers()
                 db['sessions'] = {k: v for k, v in db['sessions'].items() if v['sid'] != me}
                 drop_orphans()
                 save()
@@ -989,7 +1338,7 @@ def main():
     if not KEY or KEY.startswith('сюда'):
         sys.exit('Нет STEAM_API_KEY. Скопируйте .env.example в .env и вставьте ключ.')
     threading.Thread(target=lambda: [flush() or time.sleep(5) for _ in iter(int, 1)], daemon=True).start()
-    for fn, iv, dl in ((poll, POLL_SEC, 3), (check_bans, BAN_MIN * 60, 15)):
+    for fn, iv, dl in ((poll, POLL_SEC, 3), (check_bans, BAN_MIN * 60, 15), (poll_servers, SERVER_POLL_MIN * 60, 30)):
         threading.Thread(target=loop, args=(fn, iv, dl), daemon=True).start()
     if TG_TOKEN and MULTI:
         threading.Thread(target=bot_loop, daemon=True).start()
